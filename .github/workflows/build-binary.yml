@@ -1,0 +1,54 @@
+name: Build binary
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  build-linux:
+    name: Build Linux desktop binary
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libasound2-dev \
+            libpipewire-0.3-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --features "desktop-ui system-audio"
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          install -m 755 target/release/pipemeeter dist/pipemeeter
+          tar -C dist -czf pipemeeter-linux-x86_64.tar.gz pipemeeter
+          sha256sum pipemeeter-linux-x86_64.tar.gz > pipemeeter-linux-x86_64.tar.gz.sha256
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipemeeter-linux-x86_64
+          path: |
+            pipemeeter-linux-x86_64.tar.gz
+            pipemeeter-linux-x86_64.tar.gz.sha256
