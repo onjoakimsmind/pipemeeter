@@ -74,11 +74,12 @@ fn PreviewApp(snapshot: AudioEngineState) -> Element {
                             }
                             p { class: "mt-1 text-sm text-slate-400", "Compact desktop mixer with separate input and output decks." }
                         }
-                        div { class: "grid grid-cols-2 gap-2 text-sm sm:grid-cols-4 xl:min-w-[28rem]",
+                        div { class: "grid grid-cols-2 gap-2 text-sm sm:grid-cols-3 xl:min-w-[34rem] xl:grid-cols-5",
                             SummaryCard { title: "Inputs", value: snapshot.input_strips.len().to_string(), description: "Sources" }
                             SummaryCard { title: "Outputs", value: snapshot.output_strips.len().to_string(), description: "Buses" }
                             SummaryCard { title: "Routes", value: snapshot.active_route_count().to_string(), description: "Live" }
                             SummaryCard { title: "Muted", value: snapshot.muted_strip_count().to_string(), description: "Cuts" }
+                            SummaryCard { title: "FX", value: snapshot.active_effect_count().to_string(), description: "Active" }
                         }
                     }
                     div { class: "mt-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between",
@@ -200,6 +201,16 @@ fn PreviewStrip(strip: MixerStrip, route_targets: Vec<(StripId, String, bool)>) 
         (true, false) => Some(format!("M{mute_cc}")),
         (true, true) => None,
     };
+    let effect_summary = if strip.effects.bypassed {
+        Some("FX Byp".to_string())
+    } else {
+        let active = strip.effects.active_effect_count();
+        if active == 0 {
+            None
+        } else {
+            Some(format!("FX {active}"))
+        }
+    };
     let enabled_route_count = route_targets
         .iter()
         .filter(|(_, _, enabled)| *enabled)
@@ -219,10 +230,17 @@ fn PreviewStrip(strip: MixerStrip, route_targets: Vec<(StripId, String, bool)>) 
                 value: "{strip.label}",
                 disabled: true
             }
-            if let Some(summary) = midi_summary {
+            if effect_summary.is_some() || midi_summary.is_some() {
                 div { class: "mt-2 flex min-w-0 items-center justify-between gap-2 text-[10px] uppercase tracking-[0.22em] text-slate-500",
-                    span { "MIDI" }
-                    span { class: "min-w-0 max-w-full truncate rounded-md border border-slate-800 bg-slate-900/70 px-1.5 py-1 text-[10px] tracking-[0.16em] text-slate-300", "{summary}" }
+                    span { "State" }
+                    div { class: "flex min-w-0 items-center gap-1",
+                        if let Some(summary) = effect_summary {
+                            span { class: "min-w-0 max-w-full truncate rounded-md border border-amber-400/20 bg-amber-500/10 px-1.5 py-1 text-[10px] tracking-[0.16em] text-amber-100", "{summary}" }
+                        }
+                        if let Some(summary) = midi_summary {
+                            span { class: "min-w-0 max-w-full truncate rounded-md border border-slate-800 bg-slate-900/70 px-1.5 py-1 text-[10px] tracking-[0.16em] text-slate-300", "{summary}" }
+                        }
+                    }
                 }
             }
             div { class: "mt-2 flex flex-1 items-center justify-center gap-2",
@@ -406,6 +424,15 @@ fn PreviewSettingsDialog(
                     }
                 }
                 article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
+                    h3 { class: "text-lg font-semibold text-white", "Per-strip effects" }
+                    p { class: "mt-2 text-sm text-slate-400", "Each strip now carries gate, compressor, EQ, bypass, and reset state ready for a future PipeWire processing layer." }
+                    div { class: "mt-4 space-y-3",
+                        for strip in strips.iter().cloned() {
+                            PreviewEffectsRow { strip }
+                        }
+                    }
+                }
+                article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
                     h3 { class: "text-lg font-semibold text-white", "Per-strip MIDI bindings" }
                     p { class: "mt-2 text-sm text-slate-400", "Bindings remain available for both input and output strips, just outside the mixer surface." }
                     div { class: "mt-4 space-y-3",
@@ -413,6 +440,46 @@ fn PreviewSettingsDialog(
                             PreviewMidiBindingRow { strip }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn PreviewEffectsRow(strip: MixerStrip) -> Element {
+    rsx! {
+        div { key: "{strip.id.as_str()}-effects", class: "rounded-lg border border-slate-800 bg-slate-900/80 p-4",
+            div { class: "flex flex-wrap items-center justify-between gap-3",
+                div {
+                    div { class: "text-sm font-medium text-white", "{strip.label}" }
+                    div { class: "mt-1 text-[11px] uppercase tracking-[0.25em] text-slate-500", "{strip.kind.as_str()}" }
+                }
+                div { class: "text-xs text-slate-500",
+                    if strip.effects.bypassed { "Bypassed" } else { "Live" }
+                }
+            }
+            div { class: "mt-4 grid gap-3 sm:grid-cols-3",
+                div { class: "rounded-lg border border-slate-800 bg-slate-950/80 px-3 py-2",
+                    div { class: "text-[10px] uppercase tracking-[0.25em] text-slate-500", "Gate" }
+                    div { class: "mt-1 text-sm text-slate-200",
+                        if strip.effects.gate.enabled { "On" } else { "Off" }
+                    }
+                    div { class: "text-xs text-slate-400", "Th {strip.effects.gate.threshold_percent:.0}% / Floor {strip.effects.gate.floor_percent:.0}%" }
+                }
+                div { class: "rounded-lg border border-slate-800 bg-slate-950/80 px-3 py-2",
+                    div { class: "text-[10px] uppercase tracking-[0.25em] text-slate-500", "Comp" }
+                    div { class: "mt-1 text-sm text-slate-200",
+                        if strip.effects.compressor.enabled { "On" } else { "Off" }
+                    }
+                    div { class: "text-xs text-slate-400", "Th {strip.effects.compressor.threshold_percent:.0}% / {strip.effects.compressor.ratio:.1}:1 / {strip.effects.compressor.makeup_gain_db:.1} dB" }
+                }
+                div { class: "rounded-lg border border-slate-800 bg-slate-950/80 px-3 py-2",
+                    div { class: "text-[10px] uppercase tracking-[0.25em] text-slate-500", "EQ" }
+                    div { class: "mt-1 text-sm text-slate-200",
+                        if strip.effects.eq.enabled { "On" } else { "Off" }
+                    }
+                    div { class: "text-xs text-slate-400", "L {strip.effects.eq.low_gain_db:.1} / M {strip.effects.eq.mid_gain_db:.1} / H {strip.effects.eq.high_gain_db:.1}" }
                 }
             }
         }

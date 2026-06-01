@@ -216,11 +216,12 @@ fn app() -> Element {
                             }
                             p { class: "mt-1 text-sm text-slate-400", "Compact desktop mixer with separate input and output decks." }
                         }
-                        div { class: "grid grid-cols-2 gap-2 text-sm sm:grid-cols-4 xl:min-w-[28rem]",
+                        div { class: "grid grid-cols-2 gap-2 text-sm sm:grid-cols-3 xl:min-w-[34rem] xl:grid-cols-5",
                             SummaryCard { title: "Inputs".to_string(), value: current_snapshot.input_strips.len().to_string(), description: "Sources".to_string() }
                             SummaryCard { title: "Outputs".to_string(), value: current_snapshot.output_strips.len().to_string(), description: "Buses".to_string() }
                             SummaryCard { title: "Routes".to_string(), value: current_snapshot.active_route_count().to_string(), description: "Live".to_string() }
                             SummaryCard { title: "Muted".to_string(), value: current_snapshot.muted_strip_count().to_string(), description: "Cuts".to_string() }
+                            SummaryCard { title: "FX".to_string(), value: current_snapshot.active_effect_count().to_string(), description: "Active".to_string() }
                         }
                     }
                     div { class: "mt-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between",
@@ -372,6 +373,7 @@ fn DesktopStrip(
         "border-slate-700 bg-slate-950/80 text-slate-200"
     };
     let midi_summary = midi_summary(&strip);
+    let effect_summary = effect_summary(&strip);
     let enabled_route_count = route_targets
         .iter()
         .filter(|(_, _, enabled)| *enabled)
@@ -418,17 +420,22 @@ fn DesktopStrip(
             }
             div { class: "mt-2 flex min-w-0 items-center justify-between gap-2 text-[10px] uppercase tracking-[0.22em] text-slate-500",
                 span { "{strip_mode}" }
-                if let Some(summary) = midi_summary {
-                    span { class: "min-w-0 max-w-full truncate rounded-md border border-slate-800 bg-slate-900/70 px-1.5 py-1 text-[10px] tracking-[0.16em] text-slate-300", "{summary}" }
+                div { class: "flex min-w-0 items-center justify-end gap-1",
+                    if let Some(summary) = effect_summary {
+                        span { class: "min-w-0 max-w-full truncate rounded-md border border-amber-400/20 bg-amber-500/10 px-1.5 py-1 text-[10px] tracking-[0.16em] text-amber-100", "{summary}" }
+                    }
+                    if let Some(summary) = midi_summary {
+                        span { class: "min-w-0 max-w-full truncate rounded-md border border-slate-800 bg-slate-900/70 px-1.5 py-1 text-[10px] tracking-[0.16em] text-slate-300", "{summary}" }
+                    }
                 }
             }
-            div { class: "mt-2 grid flex-1 grid-cols-[auto_minmax(0,1fr)] items-end justify-items-center gap-3",
+            div { class: "mt-2 grid flex-1 grid-cols-[auto_minmax(0,1fr)] items-center justify-items-center gap-3",
                 div {
-                    class: "flex h-[clamp(6.25rem,18vh,11.5rem)] shrink-0 items-end justify-center self-stretch rounded-lg border border-slate-800 bg-slate-900/70 px-1.5 py-2",
+                    class: "flex h-[clamp(6.25rem,18vh,11.5rem)] shrink-0 items-center justify-center self-center rounded-lg border border-slate-800 bg-slate-900/70 px-1.5 py-2",
                     style: "{meter_tray_style}",
                     {vu_meter_columns(&strip)}
                 }
-                div { class: "flex h-[clamp(6.25rem,18vh,11.5rem)] min-w-0 w-full items-center justify-center",
+                div { class: "flex h-[clamp(6.25rem,18vh,11.5rem)] min-w-0 w-full items-center justify-center self-center",
                     input {
                         class: "h-2 w-[clamp(6.25rem,18vh,11.5rem)] -rotate-90 cursor-pointer appearance-none rounded-md bg-slate-700 accent-cyan-400",
                         r#type: "range",
@@ -453,7 +460,7 @@ fn DesktopStrip(
             }
             div { class: "{action_grid_class}",
                 button {
-                    class: "rounded-lg border px-2 py-1.5 text-xs font-medium {mute_class}",
+                    class: "inline-flex items-center justify-center rounded-lg border px-2 py-1.5 text-center text-xs font-medium leading-none {mute_class}",
                     onclick: move |_| {
                         if let Err(error) = mute_engine.send(AudioControlMsg::ToggleMute { strip: strip.id }) {
                             snapshot.write().last_notice = error;
@@ -464,9 +471,9 @@ fn DesktopStrip(
                 if !is_output {
                     button {
                         class: if strip.mono {
-                            "rounded-lg border border-amber-400/40 bg-amber-500/20 px-2 py-1.5 text-xs font-medium text-amber-100"
+                            "inline-flex items-center justify-center rounded-lg border border-amber-400/40 bg-amber-500/20 px-2 py-1.5 text-center text-xs font-medium leading-none text-amber-100"
                         } else {
-                            "rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1.5 text-xs font-medium text-slate-300"
+                            "inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1.5 text-center text-xs font-medium leading-none text-slate-300"
                         },
                         onclick: move |_| {
                             if let Err(error) = mono_engine.send(AudioControlMsg::ToggleMono { strip: strip.id }) {
@@ -477,7 +484,7 @@ fn DesktopStrip(
                     }
                 }
                 button {
-                    class: "rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1.5 text-xs font-medium text-slate-300",
+                    class: "inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1.5 text-center text-xs font-medium leading-none text-slate-300",
                     onclick: move |_| {
                         if route_editor_signal.read().as_ref() == Some(&strip.id) {
                             route_editor_signal.set(None);
@@ -521,13 +528,26 @@ fn RouteEditorPanel(
     snapshot_signal: Signal<AudioEngineState>,
 ) -> Element {
     let engine = use_context::<SharedEngineBridge>();
+    let bypass_engine = engine.clone();
+    let reset_engine = engine.clone();
+    let gate_toggle_engine = engine.clone();
+    let gate_threshold_engine = engine.clone();
+    let gate_floor_engine = engine.clone();
+    let compressor_toggle_engine = engine.clone();
+    let compressor_threshold_engine = engine.clone();
+    let compressor_ratio_engine = engine.clone();
+    let compressor_gain_engine = engine.clone();
+    let eq_toggle_engine = engine.clone();
+    let eq_low_engine = engine.clone();
+    let eq_mid_engine = engine.clone();
+    let eq_high_engine = engine.clone();
     rsx! {
         section { class: "rounded-xl border border-slate-800 bg-slate-900/80 p-4 shadow-2xl shadow-slate-950/30",
             div { class: "flex items-start justify-between gap-4 border-b border-slate-800 pb-4",
                 div {
-                    p { class: "text-sm uppercase tracking-[0.3em] text-cyan-400", "Routing" }
+                    p { class: "text-sm uppercase tracking-[0.3em] text-cyan-400", "Routing + effects" }
                     h2 { class: "mt-2 text-xl font-semibold text-white", "{strip.label}" }
-                    p { class: "mt-2 text-sm text-slate-400", "Toggle which outputs receive this strip." }
+                    p { class: "mt-2 text-sm text-slate-400", "Toggle outputs, bind route triggers, and shape the strip with gate, compressor, and EQ controls." }
                 }
                 button {
                     class: "rounded-lg border border-slate-700 bg-slate-950/70 px-4 py-2 text-sm font-medium text-slate-100",
@@ -535,36 +555,329 @@ fn RouteEditorPanel(
                     "Close"
                 }
             }
-            div { class: "mt-4 space-y-3",
-                for route in strip.routes.into_iter() {
-                    {
-                        let output_label = snapshot
-                            .output_name(route.output_id)
-                            .unwrap_or("Output")
-                            .to_string();
-                        let route_class = if route.enabled {
-                            "w-full rounded-lg border border-cyan-400/30 bg-cyan-500/10 px-4 py-3 text-left text-sm font-medium text-cyan-100"
-                        } else {
-                            "w-full rounded-lg border border-slate-800 bg-slate-950/70 px-4 py-3 text-left text-sm font-medium text-slate-200"
-                        };
-                        let toggle_engine = engine.clone();
-
-                        rsx! {
+            div { class: "mt-4 space-y-4",
+                article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
+                    div { class: "flex flex-wrap items-center justify-between gap-3",
+                        div {
+                            h3 { class: "text-lg font-semibold text-white", "Route matrix" }
+                            p { class: "mt-1 text-sm text-slate-400", "Each route can also carry its own trigger CC for controller LEDs or buttons." }
+                        }
+                        div { class: "flex flex-wrap gap-2",
                             button {
-                                key: "{strip.id.as_str()}-{route.output_id.as_str()}",
-                                class: "{route_class}",
+                                class: if strip.effects.bypassed {
+                                    "inline-flex items-center justify-center rounded-lg border border-amber-400/40 bg-amber-500/20 px-3 py-2 text-sm font-medium text-amber-100"
+                                } else {
+                                    "inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm font-medium text-slate-200"
+                                },
                                 onclick: move |_| {
-                                    if let Err(error) = toggle_engine.send(AudioControlMsg::ToggleRoute {
-                                        strip: strip.id,
-                                        output: route.output_id,
-                                    }) {
+                                    if let Err(error) = bypass_engine.send(AudioControlMsg::ToggleEffectsBypass { strip: strip.id }) {
                                         snapshot_signal.write().last_notice = error;
                                     }
                                 },
-                                div { class: "flex items-center justify-between gap-3",
-                                    span { "{output_label}" }
-                                    span { class: "text-[10px] uppercase tracking-[0.25em] text-slate-400",
-                                        if route.enabled { "On" } else { "Off" }
+                                if strip.effects.bypassed { "FX bypassed" } else { "Bypass FX" }
+                            }
+                            button {
+                                class: "inline-flex items-center justify-center rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-2 text-sm font-medium text-rose-100",
+                                onclick: move |_| {
+                                    if let Err(error) = reset_engine.send(AudioControlMsg::ResetStripEffects { strip: strip.id }) {
+                                        snapshot_signal.write().last_notice = error;
+                                    }
+                                },
+                                "Reset FX"
+                            }
+                        }
+                    }
+                    div { class: "mt-4 space-y-3",
+                        for route in strip.routes.into_iter() {
+                            {
+                                let output_label = snapshot
+                                    .output_name(route.output_id)
+                                    .unwrap_or("Output")
+                                    .to_string();
+                                let route_binding_value =
+                                    route.midi_cc.map(|value| value.to_string()).unwrap_or_default();
+                                let route_class = if route.enabled {
+                                    "flex-1 rounded-lg border border-cyan-400/30 bg-cyan-500/10 px-4 py-3 text-left text-sm font-medium text-cyan-100"
+                                } else {
+                                    "flex-1 rounded-lg border border-slate-800 bg-slate-950/70 px-4 py-3 text-left text-sm font-medium text-slate-200"
+                                };
+                                let toggle_engine = engine.clone();
+                                let binding_engine = engine.clone();
+
+                                rsx! {
+                                    div {
+                                        key: "{strip.id.as_str()}-{route.output_id.as_str()}",
+                                        class: "grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]",
+                                        button {
+                                            class: "{route_class}",
+                                            onclick: move |_| {
+                                                if let Err(error) = toggle_engine.send(AudioControlMsg::ToggleRoute {
+                                                    strip: strip.id,
+                                                    output: route.output_id,
+                                                }) {
+                                                    snapshot_signal.write().last_notice = error;
+                                                }
+                                            },
+                                            div { class: "flex items-center justify-between gap-3",
+                                                span { "{output_label}" }
+                                                span { class: "text-[10px] uppercase tracking-[0.25em] text-slate-400",
+                                                    if route.enabled { "On" } else { "Off" }
+                                                }
+                                            }
+                                        }
+                                        label { class: "space-y-1",
+                                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Route CC" }
+                                            input {
+                                                class: "w-full rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 text-sm text-slate-100 outline-none",
+                                                r#type: "number",
+                                                value: "{route_binding_value}",
+                                                oninput: move |event| {
+                                                    if let Some(controller) = parse_optional_controller(event.value()) {
+                                                        if let Err(error) = binding_engine.send(AudioControlMsg::SetRouteMidiBinding {
+                                                            strip: strip.id,
+                                                            output: route.output_id,
+                                                            controller,
+                                                        }) {
+                                                            snapshot_signal.write().last_notice = error;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
+                    h3 { class: "text-lg font-semibold text-white", "Noise gate" }
+                    p { class: "mt-1 text-sm text-slate-400", "Clamp low-level signal bleed before it reaches the bus." }
+                    div { class: "mt-4 grid gap-3 xl:grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)]",
+                        button {
+                            class: if strip.effects.gate.enabled {
+                                "inline-flex items-center justify-center rounded-lg border border-emerald-400/40 bg-emerald-500/15 px-3 py-2 text-sm font-medium text-emerald-100"
+                            } else {
+                                "inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm font-medium text-slate-200"
+                            },
+                            onclick: move |_| {
+                                if let Err(error) = gate_toggle_engine.send(AudioControlMsg::SetNoiseGateEnabled {
+                                    strip: strip.id,
+                                    enabled: !strip.effects.gate.enabled,
+                                }) {
+                                    snapshot_signal.write().last_notice = error;
+                                }
+                            },
+                            if strip.effects.gate.enabled { "Gate on" } else { "Gate off" }
+                        }
+                        label { class: "space-y-1",
+                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Threshold {strip.effects.gate.threshold_percent:.0}%" }
+                            input {
+                                class: "w-full accent-cyan-400",
+                                r#type: "range",
+                                min: "0",
+                                max: "100",
+                                step: "1",
+                                value: "{strip.effects.gate.threshold_percent}",
+                                oninput: move |event| {
+                                    if let Ok(value) = event.value().parse::<f32>() {
+                                        if let Err(error) = gate_threshold_engine.send(AudioControlMsg::SetNoiseGateThreshold {
+                                            strip: strip.id,
+                                            threshold_percent: value,
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        label { class: "space-y-1",
+                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Floor {strip.effects.gate.floor_percent:.0}%" }
+                            input {
+                                class: "w-full accent-cyan-400",
+                                r#type: "range",
+                                min: "0",
+                                max: "100",
+                                step: "1",
+                                value: "{strip.effects.gate.floor_percent}",
+                                oninput: move |event| {
+                                    if let Ok(value) = event.value().parse::<f32>() {
+                                        if let Err(error) = gate_floor_engine.send(AudioControlMsg::SetNoiseGateFloor {
+                                            strip: strip.id,
+                                            floor_percent: value,
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
+                    h3 { class: "text-lg font-semibold text-white", "Compressor" }
+                    p { class: "mt-1 text-sm text-slate-400", "Tame peaks and add make-up gain to keep the strip controlled." }
+                    div { class: "mt-4 grid gap-3 xl:grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)]",
+                        button {
+                            class: if strip.effects.compressor.enabled {
+                                "inline-flex items-center justify-center rounded-lg border border-emerald-400/40 bg-emerald-500/15 px-3 py-2 text-sm font-medium text-emerald-100"
+                            } else {
+                                "inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm font-medium text-slate-200"
+                            },
+                            onclick: move |_| {
+                                if let Err(error) = compressor_toggle_engine.send(AudioControlMsg::SetCompressorEnabled {
+                                    strip: strip.id,
+                                    enabled: !strip.effects.compressor.enabled,
+                                }) {
+                                    snapshot_signal.write().last_notice = error;
+                                }
+                            },
+                            if strip.effects.compressor.enabled { "Comp on" } else { "Comp off" }
+                        }
+                        label { class: "space-y-1",
+                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Threshold {strip.effects.compressor.threshold_percent:.0}%" }
+                            input {
+                                class: "w-full accent-cyan-400",
+                                r#type: "range",
+                                min: "0",
+                                max: "100",
+                                step: "1",
+                                value: "{strip.effects.compressor.threshold_percent}",
+                                oninput: move |event| {
+                                    if let Ok(value) = event.value().parse::<f32>() {
+                                        if let Err(error) = compressor_threshold_engine.send(AudioControlMsg::SetCompressorThreshold {
+                                            strip: strip.id,
+                                            threshold_percent: value,
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        label { class: "space-y-1",
+                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Ratio {strip.effects.compressor.ratio:.1}:1" }
+                            input {
+                                class: "w-full accent-cyan-400",
+                                r#type: "range",
+                                min: "1",
+                                max: "10",
+                                step: "0.5",
+                                value: "{strip.effects.compressor.ratio}",
+                                oninput: move |event| {
+                                    if let Ok(value) = event.value().parse::<f32>() {
+                                        if let Err(error) = compressor_ratio_engine.send(AudioControlMsg::SetCompressorRatio {
+                                            strip: strip.id,
+                                            ratio: value,
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        label { class: "space-y-1 xl:col-start-2",
+                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Make-up {strip.effects.compressor.makeup_gain_db:.1} dB" }
+                            input {
+                                class: "w-full accent-cyan-400",
+                                r#type: "range",
+                                min: "0",
+                                max: "24",
+                                step: "0.5",
+                                value: "{strip.effects.compressor.makeup_gain_db}",
+                                oninput: move |event| {
+                                    if let Ok(value) = event.value().parse::<f32>() {
+                                        if let Err(error) = compressor_gain_engine.send(AudioControlMsg::SetCompressorMakeupGain {
+                                            strip: strip.id,
+                                            gain_db: value,
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
+                    h3 { class: "text-lg font-semibold text-white", "3-band EQ" }
+                    p { class: "mt-1 text-sm text-slate-400", "Shape low, mid, and high energy with quick broad-stroke gain trims." }
+                    div { class: "mt-4 grid gap-3 xl:grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)]",
+                        button {
+                            class: if strip.effects.eq.enabled {
+                                "inline-flex items-center justify-center rounded-lg border border-emerald-400/40 bg-emerald-500/15 px-3 py-2 text-sm font-medium text-emerald-100"
+                            } else {
+                                "inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm font-medium text-slate-200"
+                            },
+                            onclick: move |_| {
+                                if let Err(error) = eq_toggle_engine.send(AudioControlMsg::SetEqEnabled {
+                                    strip: strip.id,
+                                    enabled: !strip.effects.eq.enabled,
+                                }) {
+                                    snapshot_signal.write().last_notice = error;
+                                }
+                            },
+                            if strip.effects.eq.enabled { "EQ on" } else { "EQ off" }
+                        }
+                        label { class: "space-y-1",
+                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Low {strip.effects.eq.low_gain_db:.1} dB" }
+                            input {
+                                class: "w-full accent-cyan-400",
+                                r#type: "range",
+                                min: "-12",
+                                max: "12",
+                                step: "0.5",
+                                value: "{strip.effects.eq.low_gain_db}",
+                                oninput: move |event| {
+                                    if let Ok(value) = event.value().parse::<f32>() {
+                                        if let Err(error) = eq_low_engine.send(AudioControlMsg::SetEqLowGain {
+                                            strip: strip.id,
+                                            gain_db: value,
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        label { class: "space-y-1",
+                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Mid {strip.effects.eq.mid_gain_db:.1} dB" }
+                            input {
+                                class: "w-full accent-cyan-400",
+                                r#type: "range",
+                                min: "-12",
+                                max: "12",
+                                step: "0.5",
+                                value: "{strip.effects.eq.mid_gain_db}",
+                                oninput: move |event| {
+                                    if let Ok(value) = event.value().parse::<f32>() {
+                                        if let Err(error) = eq_mid_engine.send(AudioControlMsg::SetEqMidGain {
+                                            strip: strip.id,
+                                            gain_db: value,
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        label { class: "space-y-1",
+                            span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "High {strip.effects.eq.high_gain_db:.1} dB" }
+                            input {
+                                class: "w-full accent-cyan-400",
+                                r#type: "range",
+                                min: "-12",
+                                max: "12",
+                                step: "0.5",
+                                value: "{strip.effects.eq.high_gain_db}",
+                                oninput: move |event| {
+                                    if let Ok(value) = event.value().parse::<f32>() {
+                                        if let Err(error) = eq_high_engine.send(AudioControlMsg::SetEqHighGain {
+                                            strip: strip.id,
+                                            gain_db: value,
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
                                     }
                                 }
                             }
@@ -591,6 +904,14 @@ fn SettingsModal(
 ) -> Element {
     let engine = use_context::<SharedEngineBridge>();
     let midi_test_engine = engine.clone();
+    let midi_feedback_output_engine = engine.clone();
+    let midi_feedback_sync_engine = engine.clone();
+    let reset_mixer_engine = engine.clone();
+    let midi_feedback_output = snapshot
+        .midi_feedback
+        .output_port_name
+        .clone()
+        .unwrap_or_default();
     rsx! {
         div { class: "fixed inset-0 z-40 flex items-start justify-center bg-slate-950/70 p-6 backdrop-blur-sm",
             section { class: "flex h-[min(92vh,980px)] w-full max-w-5xl flex-col rounded-2xl border border-slate-800 bg-slate-900/95 p-4 shadow-2xl shadow-black/50",
@@ -607,6 +928,56 @@ fn SettingsModal(
                     }
                 }
                 div { class: "mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto pr-1",
+                    article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
+                        h3 { class: "text-lg font-semibold text-white", "MIDI feedback + reset" }
+                        p { class: "mt-2 text-sm text-slate-400", "Select the controller output used for LEDs and push a full resync after binding changes. Reset rebuilds the default sink/output layout and saves it back to config." }
+                        div { class: "mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto_auto]",
+                            label { class: "space-y-1",
+                                span { class: "block text-[10px] uppercase tracking-[0.25em] text-slate-500", "Feedback output" }
+                                select {
+                                    class: "w-full rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-3 text-sm text-slate-100 outline-none",
+                                    value: "{midi_feedback_output}",
+                                    oninput: move |event| {
+                                        let value = event.value();
+                                        if let Err(error) = midi_feedback_output_engine.send(AudioControlMsg::SetMidiFeedbackOutput {
+                                            port_name: if value.trim().is_empty() {
+                                                None
+                                            } else {
+                                                Some(value)
+                                            },
+                                        }) {
+                                            snapshot_signal.write().last_notice = error;
+                                        }
+                                    },
+                                    option { value: "", "Disabled" }
+                                    for port in snapshot.inventory.midi_outputs.iter() {
+                                        option { key: "{port.name}", value: "{port.name}", "{port.name}" }
+                                    }
+                                }
+                            }
+                            button {
+                                class: "mt-[1.35rem] inline-flex items-center justify-center rounded-lg border border-cyan-400/40 bg-cyan-500/10 px-4 py-3 text-sm font-medium text-cyan-100",
+                                onclick: move |_| {
+                                    if let Err(error) = midi_feedback_sync_engine.send(AudioControlMsg::SyncMidiFeedback) {
+                                        snapshot_signal.write().last_notice = error;
+                                    }
+                                },
+                                "Resync LEDs"
+                            }
+                            button {
+                                class: "mt-[1.35rem] inline-flex items-center justify-center rounded-lg border border-rose-400/40 bg-rose-500/10 px-4 py-3 text-sm font-medium text-rose-100",
+                                onclick: move |_| {
+                                    if let Err(error) = reset_mixer_engine.send(AudioControlMsg::ResetMixer) {
+                                        snapshot_signal.write().last_notice = error;
+                                    }
+                                },
+                                "Reset sinks"
+                            }
+                        }
+                        div { class: "mt-3 rounded-lg border border-slate-800 bg-slate-900/80 px-4 py-3 text-sm text-slate-300",
+                            "{snapshot.inventory.midi_feedback_status}"
+                        }
+                    }
                     article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
                         h3 { class: "text-lg font-semibold text-white", "MIDI test injector" }
                         p { class: "mt-2 text-sm text-slate-400", "Send CC messages without a hardware controller to validate mappings." }
@@ -648,9 +1019,10 @@ fn SettingsModal(
                     article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
                         h3 { class: "text-lg font-semibold text-white", "Runtime inventory" }
                         p { class: "mt-2 text-sm text-slate-400", "PipeWire and MIDI discovery stay available here without crowding the mixer window." }
-                        div { class: "mt-4 grid gap-3 sm:grid-cols-2",
+                        div { class: "mt-4 grid gap-3 sm:grid-cols-3",
                             InventoryBlock { label: "PipeWire".to_string(), message: snapshot.inventory.pipewire_status.clone() }
                             InventoryBlock { label: "MIDI".to_string(), message: snapshot.inventory.midi_status.clone() }
+                            InventoryBlock { label: "Feedback".to_string(), message: snapshot.inventory.midi_feedback_status.clone() }
                         }
                     }
                     article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
@@ -676,7 +1048,24 @@ fn SettingsModal(
                                     "No MIDI controllers are visible yet."
                                 }
                             } else {
-                                for port in snapshot.inventory.midi_inputs.into_iter() {
+                                for port in snapshot.inventory.midi_inputs.iter() {
+                                    div { key: "{port.name}", class: "rounded-lg border border-slate-800 bg-slate-900/80 px-4 py-3 text-sm text-slate-200",
+                                        "{port.name}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    article { class: "rounded-xl border border-slate-800 bg-slate-950/70 p-4",
+                        h3 { class: "text-lg font-semibold text-white", "Detected MIDI outputs" }
+                        p { class: "mt-2 text-sm text-slate-400", "Use one of these ports for controller LED feedback." }
+                        div { class: "mt-4 space-y-3",
+                            if snapshot.inventory.midi_outputs.is_empty() {
+                                div { class: "rounded-lg border border-dashed border-slate-700 px-4 py-5 text-sm text-slate-400",
+                                    "No MIDI feedback outputs are visible yet."
+                                }
+                            } else {
+                                for port in snapshot.inventory.midi_outputs.iter() {
                                     div { key: "{port.name}", class: "rounded-lg border border-slate-800 bg-slate-900/80 px-4 py-3 text-sm text-slate-200",
                                         "{port.name}"
                                     }
@@ -823,6 +1212,19 @@ fn midi_summary(strip: &MixerStrip) -> Option<String> {
     }
 }
 
+fn effect_summary(strip: &MixerStrip) -> Option<String> {
+    if strip.effects.bypassed {
+        Some("FX Byp".to_string())
+    } else {
+        let active = strip.effects.active_effect_count();
+        if active == 0 {
+            None
+        } else {
+            Some(format!("FX {active}"))
+        }
+    }
+}
+
 fn apply_midi_binding(
     engine: &SharedEngineBridge,
     mut snapshot_signal: Signal<AudioEngineState>,
@@ -830,12 +1232,7 @@ fn apply_midi_binding(
     field: MidiField,
     value: String,
 ) {
-    let controller = match value.trim() {
-        "" => Some(None),
-        raw => raw.parse::<u8>().ok().map(Some),
-    };
-
-    if let Some(controller) = controller {
+    if let Some(controller) = parse_optional_controller(value) {
         let target = match field {
             MidiField::Volume => MidiControlTarget::Volume,
             MidiField::Mute => MidiControlTarget::Mute,
@@ -847,6 +1244,13 @@ fn apply_midi_binding(
         }) {
             snapshot_signal.write().last_notice = error;
         }
+    }
+}
+
+fn parse_optional_controller(value: String) -> Option<Option<u8>> {
+    match value.trim() {
+        "" => Some(None),
+        raw => raw.parse::<u8>().ok().map(Some),
     }
 }
 
@@ -867,20 +1271,22 @@ fn sync_midi_inputs_from_snapshot(
         active_keys.push(volume_key);
         active_keys.push(mute_key);
 
-        midi_inputs.entry(volume_key).or_insert_with(|| {
+        midi_inputs.insert(
+            volume_key,
             strip
                 .midi
                 .volume_cc
                 .map(|value| value.to_string())
-                .unwrap_or_default()
-        });
-        midi_inputs.entry(mute_key).or_insert_with(|| {
+                .unwrap_or_default(),
+        );
+        midi_inputs.insert(
+            mute_key,
             strip
                 .midi
                 .mute_cc
                 .map(|value| value.to_string())
-                .unwrap_or_default()
-        });
+                .unwrap_or_default(),
+        );
     }
 
     midi_inputs.retain(|key, _| active_keys.contains(key));
@@ -901,7 +1307,7 @@ fn vu_meter_columns(strip: &MixerStrip) -> Element {
         .collect::<Vec<_>>();
 
     rsx! {
-        div { class: "flex h-full w-full items-end justify-center gap-1.5",
+        div { class: "flex h-full w-full items-center justify-center gap-1.5",
             for (key, fill_height, empty_height) in channel_levels {
                 div {
                     key: "{key}",

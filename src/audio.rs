@@ -10,7 +10,7 @@ use std::{
 };
 
 #[cfg(feature = "system-audio")]
-use midir::MidiInput;
+use midir::{MidiInput, MidiOutput, MidiOutputConnection};
 #[cfg(feature = "system-audio")]
 use pipewire as pw;
 use serde::{Deserialize, Serialize};
@@ -25,9 +25,208 @@ const DEFAULT_OUTPUTS: [&str; 2] = ["Speakers", "Stream"];
 const METER_CHANNEL_COUNT: usize = 2;
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CONFIG_VERSION: u32 = 1;
+#[cfg(any(test, feature = "system-audio"))]
+const MIDI_FEEDBACK_CHANNEL_STATUS: u8 = 0xB0;
+#[cfg(any(test, feature = "system-audio"))]
+const MIDI_FEEDBACK_ON_VALUE: u8 = 127;
+#[cfg(any(test, feature = "system-audio"))]
+const MIDI_FEEDBACK_OFF_VALUE: u8 = 0;
 
 const fn default_channel_count() -> usize {
     METER_CHANNEL_COUNT
+}
+
+fn scan_midi_outputs() -> Result<Vec<MidiPortInfo>, String> {
+    #[cfg(not(feature = "system-audio"))]
+    {
+        return Err("compiled without `system-audio`; enable it to query MIDI devices".to_string());
+    }
+
+    #[cfg(feature = "system-audio")]
+    {
+        let output = MidiOutput::new("pipemeeter-feedback-discovery")
+            .map_err(|error| format!("could not create midi output client: {error}"))?;
+
+        let mut ports = output
+            .ports()
+            .into_iter()
+            .map(|port| {
+                output
+                    .port_name(&port)
+                    .map(|name| MidiPortInfo { name })
+                    .map_err(|error| format!("failed to read midi port name: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        ports.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(ports)
+    }
+}
+
+#[cfg(any(test, feature = "system-audio"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MidiFeedbackMessage {
+    controller: u8,
+    value: u8,
+}
+
+#[derive(Default)]
+struct MidiFeedbackRuntime {
+    #[cfg(feature = "system-audio")]
+    connection: Option<MidiOutputConnection>,
+    connected_port_name: Option<String>,
+}
+
+impl MidiFeedbackRuntime {
+    fn sync_connection(&mut self, state: &mut AudioEngineState) {
+        let Some(selected_port) = state.midi_feedback.output_port_name.clone() else {
+            self.disconnect();
+            state.inventory.midi_feedback_status = "MIDI feedback disabled".to_string();
+            return;
+        };
+
+        if self.connected_port_name.as_deref() == Some(selected_port.as_str()) {
+            state.inventory.midi_feedback_status =
+                format!("MIDI feedback ready on {}", selected_port);
+            return;
+        }
+
+        #[cfg(not(feature = "system-audio"))]
+        {
+            self.connected_port_name = None;
+            state.inventory.midi_feedback_status =
+                "MIDI feedback unavailable: compiled without `system-audio`".to_string();
+            return;
+        }
+
+        #[cfg(feature = "system-audio")]
+        {
+            self.disconnect();
+
+            let output = match MidiOutput::new("pipemeeter-feedback") {
+                Ok(output) => output,
+                Err(error) => {
+                    state.inventory.midi_feedback_status =
+                        format!("MIDI feedback unavailable: {error}");
+                    return;
+                }
+            };
+
+            let port =
+                match output.ports().into_iter().find(|port| {
+                    output.port_name(port).ok().as_deref() == Some(selected_port.as_str())
+                }) {
+                    Some(port) => port,
+                    None => {
+                        state.inventory.midi_feedback_status =
+                            format!("MIDI feedback port not found: {selected_port}");
+                        return;
+                    }
+                };
+
+            match output.connect(&port, "pipemeeter-feedback") {
+                Ok(connection) => {
+                    self.connection = Some(connection);
+                    self.connected_port_name = Some(selected_port.clone());
+                    state.inventory.midi_feedback_status =
+                        format!("MIDI feedback ready on {selected_port}");
+                }
+                Err(error) => {
+                    state.inventory.midi_feedback_status =
+                        format!("Failed to connect MIDI feedback output {selected_port}: {error}");
+                }
+            }
+        }
+    }
+
+    fn send_snapshot(&mut self, state: &mut AudioEngineState) {
+        if state.midi_feedback.output_port_name.is_none() {
+            return;
+        }
+
+        if self.connected_port_name.is_none() {
+            self.sync_connection(state);
+        }
+
+        #[cfg(not(feature = "system-audio"))]
+        {
+            state.inventory.midi_feedback_status =
+                "MIDI feedback unavailable: compiled without `system-audio`".to_string();
+        }
+
+        #[cfg(feature = "system-audio")]
+        {
+            let Some(connection) = self.connection.as_mut() else {
+                return;
+            };
+            let port_name = self.connected_port_name.clone().unwrap_or_default();
+
+            for message in collect_midi_feedback_messages(state) {
+                if let Err(error) = connection.send(&[
+                    MIDI_FEEDBACK_CHANNEL_STATUS,
+                    message.controller,
+                    message.value,
+                ]) {
+                    self.disconnect();
+                    state.inventory.midi_feedback_status =
+                        format!("MIDI feedback send failed on {port_name}: {error}");
+                    return;
+                }
+            }
+
+            state.inventory.midi_feedback_status = format!("MIDI feedback synced to {port_name}");
+        }
+    }
+
+    fn disconnect(&mut self) {
+        #[cfg(feature = "system-audio")]
+        {
+            self.connection = None;
+        }
+        self.connected_port_name = None;
+    }
+}
+
+#[cfg(any(test, feature = "system-audio"))]
+fn collect_midi_feedback_messages(state: &AudioEngineState) -> Vec<MidiFeedbackMessage> {
+    let mut messages = Vec::new();
+
+    for strip in state.input_strips.iter().chain(state.output_strips.iter()) {
+        if let Some(controller) = strip.midi.volume_cc {
+            messages.push(MidiFeedbackMessage {
+                controller,
+                value: ((strip.volume.as_ratio() * 127.0).round() as i32).clamp(0, 127) as u8,
+            });
+        }
+
+        if let Some(controller) = strip.midi.mute_cc {
+            messages.push(MidiFeedbackMessage {
+                controller,
+                value: if strip.muted {
+                    MIDI_FEEDBACK_ON_VALUE
+                } else {
+                    MIDI_FEEDBACK_OFF_VALUE
+                },
+            });
+        }
+    }
+
+    for strip in &state.input_strips {
+        for route in &strip.routes {
+            if let Some(controller) = route.midi_cc {
+                messages.push(MidiFeedbackMessage {
+                    controller,
+                    value: if route.enabled {
+                        MIDI_FEEDBACK_ON_VALUE
+                    } else {
+                        MIDI_FEEDBACK_OFF_VALUE
+                    },
+                });
+            }
+        }
+    }
+
+    messages
 }
 
 const fn default_mono_state() -> bool {
@@ -131,10 +330,124 @@ pub struct MidiBinding {
     pub mute_cc: Option<u8>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiFeedbackConfig {
+    #[serde(default)]
+    pub output_port_name: Option<String>,
+}
+
+fn default_gate_threshold_percent() -> f32 {
+    18.0
+}
+
+fn default_gate_floor_percent() -> f32 {
+    0.0
+}
+
+fn default_compressor_threshold_percent() -> f32 {
+    78.0
+}
+
+fn default_compressor_ratio() -> f32 {
+    3.0
+}
+
+fn default_eq_gain_db() -> f32 {
+    0.0
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NoiseGateSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_gate_threshold_percent")]
+    pub threshold_percent: f32,
+    #[serde(default = "default_gate_floor_percent")]
+    pub floor_percent: f32,
+}
+
+impl Default for NoiseGateSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_percent: default_gate_threshold_percent(),
+            floor_percent: default_gate_floor_percent(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompressorSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_compressor_threshold_percent")]
+    pub threshold_percent: f32,
+    #[serde(default = "default_compressor_ratio")]
+    pub ratio: f32,
+    #[serde(default)]
+    pub makeup_gain_db: f32,
+}
+
+impl Default for CompressorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_percent: default_compressor_threshold_percent(),
+            ratio: default_compressor_ratio(),
+            makeup_gain_db: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EqSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_eq_gain_db")]
+    pub low_gain_db: f32,
+    #[serde(default = "default_eq_gain_db")]
+    pub mid_gain_db: f32,
+    #[serde(default = "default_eq_gain_db")]
+    pub high_gain_db: f32,
+}
+
+impl Default for EqSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            low_gain_db: default_eq_gain_db(),
+            mid_gain_db: default_eq_gain_db(),
+            high_gain_db: default_eq_gain_db(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct StripEffects {
+    #[serde(default)]
+    pub bypassed: bool,
+    #[serde(default)]
+    pub gate: NoiseGateSettings,
+    #[serde(default)]
+    pub compressor: CompressorSettings,
+    #[serde(default)]
+    pub eq: EqSettings,
+}
+
+impl StripEffects {
+    pub fn active_effect_count(&self) -> usize {
+        usize::from(self.gate.enabled)
+            + usize::from(self.compressor.enabled)
+            + usize::from(self.eq.enabled)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RouteState {
     pub output_id: StripId,
     pub enabled: bool,
+    #[serde(default)]
+    pub midi_cc: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,6 +463,7 @@ pub struct MixerStrip {
     pub muted: bool,
     pub midi: MidiBinding,
     pub routes: Vec<RouteState>,
+    pub effects: StripEffects,
 }
 
 impl MixerStrip {
@@ -167,6 +481,7 @@ impl MixerStrip {
             muted: false,
             midi: MidiBinding::default(),
             routes: Vec::new(),
+            effects: StripEffects::default(),
         }
     }
 
@@ -183,6 +498,8 @@ impl MixerStrip {
 struct PersistedState {
     version: u32,
     next_strip_id: u32,
+    #[serde(default)]
+    midi_feedback: MidiFeedbackConfig,
     input_strips: Vec<PersistedStrip>,
     output_strips: Vec<PersistedStrip>,
 }
@@ -200,6 +517,8 @@ struct PersistedStrip {
     muted: bool,
     midi: MidiBinding,
     routes: Vec<RouteState>,
+    #[serde(default)]
+    effects: StripEffects,
 }
 
 impl PersistedState {
@@ -207,6 +526,7 @@ impl PersistedState {
         Self {
             version: CONFIG_VERSION,
             next_strip_id: state.next_strip_id,
+            midi_feedback: state.midi_feedback.clone(),
             input_strips: state
                 .input_strips
                 .iter()
@@ -260,6 +580,7 @@ impl PersistedState {
             input_strips,
             output_strips,
             inventory: BackendInventory::default(),
+            midi_feedback: self.midi_feedback,
             next_strip_id: self.next_strip_id.max(max_strip_id),
             last_notice: "Loaded config".to_string(),
         })
@@ -278,6 +599,7 @@ impl PersistedStrip {
             muted: strip.muted,
             midi: strip.midi,
             routes: strip.routes,
+            effects: strip.effects,
         }
     }
 
@@ -327,6 +649,7 @@ impl PersistedStrip {
         strip.muted = self.muted;
         strip.midi = self.midi;
         strip.routes = self.routes;
+        strip.effects = self.effects;
         Ok(strip)
     }
 }
@@ -349,6 +672,8 @@ pub struct BackendInventory {
     pub pipewire_nodes: Vec<PipeWireNodeInfo>,
     pub midi_status: String,
     pub midi_inputs: Vec<MidiPortInfo>,
+    pub midi_outputs: Vec<MidiPortInfo>,
+    pub midi_feedback_status: String,
 }
 
 impl Default for BackendInventory {
@@ -358,6 +683,8 @@ impl Default for BackendInventory {
             pipewire_nodes: Vec::new(),
             midi_status: "Waiting for first MIDI scan".to_string(),
             midi_inputs: Vec::new(),
+            midi_outputs: Vec::new(),
+            midi_feedback_status: "MIDI feedback disabled".to_string(),
         }
     }
 }
@@ -367,6 +694,7 @@ pub struct AudioEngineState {
     pub input_strips: Vec<MixerStrip>,
     pub output_strips: Vec<MixerStrip>,
     pub inventory: BackendInventory,
+    pub midi_feedback: MidiFeedbackConfig,
     pub next_strip_id: u32,
     pub last_notice: String,
 }
@@ -398,6 +726,7 @@ impl Default for AudioEngineState {
                 .map(|(output_index, output_id)| RouteState {
                     output_id: *output_id,
                     enabled: index == output_index || (index == 0 && output_index == 1),
+                    midi_cc: None,
                 })
                 .collect();
             input_strips.push(strip);
@@ -408,6 +737,7 @@ impl Default for AudioEngineState {
             input_strips,
             output_strips,
             inventory: BackendInventory::default(),
+            midi_feedback: MidiFeedbackConfig::default(),
             next_strip_id,
             last_notice: "Booting audio engine".to_string(),
         }
@@ -433,6 +763,14 @@ impl AudioEngineState {
             .chain(self.output_strips.iter())
             .filter(|strip| strip.muted)
             .count()
+    }
+
+    pub fn active_effect_count(&self) -> usize {
+        self.input_strips
+            .iter()
+            .chain(self.output_strips.iter())
+            .map(|strip| strip.effects.active_effect_count())
+            .sum()
     }
 
     pub fn output_name(&self, output_id: StripId) -> Option<&str> {
@@ -462,6 +800,10 @@ impl AudioEngineState {
         self.output_strips
             .iter_mut()
             .find(|candidate| candidate.id == strip_id)
+    }
+
+    fn effects_mut(&mut self, strip_id: StripId) -> Option<&mut StripEffects> {
+        self.strip_mut(strip_id).map(|strip| &mut strip.effects)
     }
 
     fn apply_volume(&mut self, strip_id: StripId, volume: NormalizedVolume) {
@@ -540,6 +882,7 @@ impl AudioEngineState {
             .map(|(index, output)| RouteState {
                 output_id: output.id,
                 enabled: index == 0,
+                midi_cc: None,
             })
             .collect();
 
@@ -561,6 +904,7 @@ impl AudioEngineState {
             strip.routes.push(RouteState {
                 output_id: output.id,
                 enabled: false,
+                midi_cc: None,
             });
         }
 
@@ -611,6 +955,192 @@ impl AudioEngineState {
         }
     }
 
+    fn set_route_midi_binding(
+        &mut self,
+        strip_id: StripId,
+        output_id: StripId,
+        controller: Option<u8>,
+    ) {
+        if let Some(strip) = self
+            .input_strips
+            .iter_mut()
+            .find(|candidate| candidate.id == strip_id)
+        {
+            if let Some(route) = strip
+                .routes
+                .iter_mut()
+                .find(|route| route.output_id == output_id)
+            {
+                route.midi_cc = controller;
+            } else {
+                self.last_notice = format!(
+                    "Tried to assign MIDI binding to missing route {} on {}",
+                    output_id.as_u32(),
+                    strip_id.as_u32()
+                );
+            }
+        } else {
+            self.last_notice = format!(
+                "Tried to assign MIDI binding to missing input strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_midi_feedback_output(&mut self, output_port_name: Option<String>) {
+        self.midi_feedback.output_port_name = output_port_name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+    }
+
+    fn reset_mixer(&mut self) {
+        let inventory = self.inventory.clone();
+        let midi_feedback = self.midi_feedback.clone();
+        *self = Self::default();
+        self.inventory = inventory;
+        self.midi_feedback = midi_feedback;
+    }
+
+    fn toggle_effects_bypass(&mut self, strip_id: StripId) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.bypassed = !effects.bypassed;
+        } else {
+            self.last_notice = format!(
+                "Tried to change effects bypass on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn reset_strip_effects(&mut self, strip_id: StripId) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            *effects = StripEffects::default();
+        } else {
+            self.last_notice = format!(
+                "Tried to reset effects on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_gate_enabled(&mut self, strip_id: StripId, enabled: bool) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.gate.enabled = enabled;
+        } else {
+            self.last_notice = format!(
+                "Tried to update gate on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_gate_threshold(&mut self, strip_id: StripId, threshold_percent: f32) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.gate.threshold_percent = clamp_percent(threshold_percent);
+        } else {
+            self.last_notice = format!(
+                "Tried to update gate threshold on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_gate_floor(&mut self, strip_id: StripId, floor_percent: f32) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.gate.floor_percent = clamp_percent(floor_percent);
+        } else {
+            self.last_notice = format!(
+                "Tried to update gate floor on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_compressor_enabled(&mut self, strip_id: StripId, enabled: bool) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.compressor.enabled = enabled;
+        } else {
+            self.last_notice = format!(
+                "Tried to update compressor on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_compressor_threshold(&mut self, strip_id: StripId, threshold_percent: f32) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.compressor.threshold_percent = clamp_percent(threshold_percent);
+        } else {
+            self.last_notice = format!(
+                "Tried to update compressor threshold on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_compressor_ratio(&mut self, strip_id: StripId, ratio: f32) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.compressor.ratio = clamp_ratio(ratio);
+        } else {
+            self.last_notice = format!(
+                "Tried to update compressor ratio on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_compressor_makeup_gain(&mut self, strip_id: StripId, gain_db: f32) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.compressor.makeup_gain_db = clamp_makeup_gain_db(gain_db);
+        } else {
+            self.last_notice = format!(
+                "Tried to update compressor gain on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_eq_enabled(&mut self, strip_id: StripId, enabled: bool) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.eq.enabled = enabled;
+        } else {
+            self.last_notice = format!("Tried to update EQ on missing strip {}", strip_id.as_u32());
+        }
+    }
+
+    fn set_eq_low_gain(&mut self, strip_id: StripId, gain_db: f32) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.eq.low_gain_db = clamp_eq_gain_db(gain_db);
+        } else {
+            self.last_notice = format!(
+                "Tried to update low EQ on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_eq_mid_gain(&mut self, strip_id: StripId, gain_db: f32) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.eq.mid_gain_db = clamp_eq_gain_db(gain_db);
+        } else {
+            self.last_notice = format!(
+                "Tried to update mid EQ on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
+    fn set_eq_high_gain(&mut self, strip_id: StripId, gain_db: f32) {
+        if let Some(effects) = self.effects_mut(strip_id) {
+            effects.eq.high_gain_db = clamp_eq_gain_db(gain_db);
+        } else {
+            self.last_notice = format!(
+                "Tried to update high EQ on missing strip {}",
+                strip_id.as_u32()
+            );
+        }
+    }
+
     fn apply_midi_cc(&mut self, controller: u8, value: u8) -> usize {
         let mut affected = 0;
 
@@ -647,10 +1177,12 @@ impl AudioEngineState {
                         .expect("simulated input meter level should be valid")
                 })
                 .collect::<Vec<_>>();
+            let processed_levels =
+                apply_strip_effects_to_levels(raw_channel_levels, &strip.effects);
             let channel_levels = if strip.mono {
-                vec![average_meter_level(&raw_channel_levels)]
+                vec![average_meter_level(&processed_levels)]
             } else {
-                raw_channel_levels
+                processed_levels
             };
             strip.meter_level = peak_meter_level(&channel_levels);
             strip.meter_channels = channel_levels;
@@ -706,10 +1238,74 @@ impl AudioEngineState {
                         .expect("simulated output meter level should be valid")
                 })
                 .collect::<Vec<_>>();
+            let channel_levels = apply_strip_effects_to_levels(channel_levels, &output.effects);
             output.meter_level = peak_meter_level(&channel_levels);
             output.meter_channels = channel_levels;
         }
     }
+}
+
+fn clamp_percent(value: f32) -> f32 {
+    value.clamp(0.0, 100.0)
+}
+
+fn clamp_ratio(value: f32) -> f32 {
+    value.clamp(1.0, 20.0)
+}
+
+fn clamp_makeup_gain_db(value: f32) -> f32 {
+    value.clamp(0.0, 24.0)
+}
+
+fn clamp_eq_gain_db(value: f32) -> f32 {
+    value.clamp(-12.0, 12.0)
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    10_f32.powf(db / 20.0)
+}
+
+fn apply_strip_effects_to_levels(
+    levels: Vec<NormalizedVolume>,
+    effects: &StripEffects,
+) -> Vec<NormalizedVolume> {
+    if effects.bypassed {
+        return levels;
+    }
+
+    levels
+        .into_iter()
+        .enumerate()
+        .map(|(index, level)| {
+            let mut ratio = level.as_ratio();
+
+            if effects.gate.enabled && ratio < effects.gate.threshold_percent / 100.0 {
+                ratio *= effects.gate.floor_percent / 100.0;
+            }
+
+            if effects.eq.enabled {
+                let band_db = match index % 3 {
+                    0 => effects.eq.low_gain_db,
+                    1 => effects.eq.high_gain_db,
+                    _ => effects.eq.mid_gain_db,
+                };
+                let blended_db = (band_db + effects.eq.mid_gain_db) / 2.0;
+                ratio *= db_to_gain(blended_db);
+            }
+
+            if effects.compressor.enabled {
+                let threshold = effects.compressor.threshold_percent / 100.0;
+                let ratio_value = clamp_ratio(effects.compressor.ratio);
+                if ratio > threshold {
+                    ratio = threshold + (ratio - threshold) / ratio_value;
+                }
+                ratio *= db_to_gain(effects.compressor.makeup_gain_db);
+            }
+
+            NormalizedVolume::new(ratio.clamp(0.0, 1.0))
+                .expect("effect-processed meter level should be valid")
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -732,6 +1328,56 @@ pub enum AudioControlMsg {
     ToggleMono {
         strip: StripId,
     },
+    ToggleEffectsBypass {
+        strip: StripId,
+    },
+    ResetStripEffects {
+        strip: StripId,
+    },
+    SetNoiseGateEnabled {
+        strip: StripId,
+        enabled: bool,
+    },
+    SetNoiseGateThreshold {
+        strip: StripId,
+        threshold_percent: f32,
+    },
+    SetNoiseGateFloor {
+        strip: StripId,
+        floor_percent: f32,
+    },
+    SetCompressorEnabled {
+        strip: StripId,
+        enabled: bool,
+    },
+    SetCompressorThreshold {
+        strip: StripId,
+        threshold_percent: f32,
+    },
+    SetCompressorRatio {
+        strip: StripId,
+        ratio: f32,
+    },
+    SetCompressorMakeupGain {
+        strip: StripId,
+        gain_db: f32,
+    },
+    SetEqEnabled {
+        strip: StripId,
+        enabled: bool,
+    },
+    SetEqLowGain {
+        strip: StripId,
+        gain_db: f32,
+    },
+    SetEqMidGain {
+        strip: StripId,
+        gain_db: f32,
+    },
+    SetEqHighGain {
+        strip: StripId,
+        gain_db: f32,
+    },
     RemoveStrip {
         strip: StripId,
     },
@@ -741,11 +1387,21 @@ pub enum AudioControlMsg {
     AddOutput {
         label: String,
     },
+    ResetMixer,
     SetMidiBinding {
         strip: StripId,
         target: MidiControlTarget,
         controller: Option<u8>,
     },
+    SetRouteMidiBinding {
+        strip: StripId,
+        output: StripId,
+        controller: Option<u8>,
+    },
+    SetMidiFeedbackOutput {
+        port_name: Option<String>,
+    },
+    SyncMidiFeedback,
     ApplyMidiCc {
         controller: u8,
         value: u8,
@@ -821,8 +1477,11 @@ impl Drop for EngineBridge {
 
 fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUpdateMsg>) {
     let mut state = load_initial_state();
+    let mut midi_feedback = MidiFeedbackRuntime::default();
     let mut meter_phase = 0_u64;
     refresh_inventory(&mut state, false);
+    midi_feedback.sync_connection(&mut state);
+    midi_feedback.send_snapshot(&mut state);
     state.update_vu_meters(meter_phase);
     push_snapshot(&updates_tx, &state);
 
@@ -836,6 +1495,7 @@ fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUp
                     volume.as_percent_text()
                 );
                 persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::RenameStrip { strip, label }) => {
@@ -843,6 +1503,7 @@ fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUp
                 state.last_notice =
                     format!("Renamed {}", state.strip_label(strip).unwrap_or("strip"));
                 persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::ToggleRoute { strip, output }) => {
@@ -854,6 +1515,7 @@ fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUp
                     state.strip_label(strip).unwrap_or("strip")
                 );
                 persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::ToggleMute { strip }) => {
@@ -868,6 +1530,7 @@ fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUp
                     mute_state
                 );
                 persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::ToggleMono { strip }) => {
@@ -880,6 +1543,155 @@ fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUp
                     "{} set to {}",
                     state.strip_label(strip).unwrap_or("Strip"),
                     mono_state
+                );
+                persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::ToggleEffectsBypass { strip }) => {
+                state.toggle_effects_bypass(strip);
+                let bypass_state = state
+                    .strip_mut(strip)
+                    .map(|candidate| {
+                        if candidate.effects.bypassed {
+                            "effects bypassed"
+                        } else {
+                            "effects engaged"
+                        }
+                    })
+                    .unwrap_or("effects updated");
+                state.last_notice = format!(
+                    "{} {}",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    bypass_state
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::ResetStripEffects { strip }) => {
+                state.reset_strip_effects(strip);
+                state.last_notice = format!(
+                    "Reset effects on {}",
+                    state.strip_label(strip).unwrap_or("strip")
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetNoiseGateEnabled { strip, enabled }) => {
+                state.set_gate_enabled(strip, enabled);
+                state.last_notice = format!(
+                    "{} gate {}",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    if enabled { "enabled" } else { "disabled" }
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetNoiseGateThreshold {
+                strip,
+                threshold_percent,
+            }) => {
+                state.set_gate_threshold(strip, threshold_percent);
+                state.last_notice = format!(
+                    "{} gate threshold {}%",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    threshold_percent.round()
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetNoiseGateFloor {
+                strip,
+                floor_percent,
+            }) => {
+                state.set_gate_floor(strip, floor_percent);
+                state.last_notice = format!(
+                    "{} gate floor {}%",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    floor_percent.round()
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetCompressorEnabled { strip, enabled }) => {
+                state.set_compressor_enabled(strip, enabled);
+                state.last_notice = format!(
+                    "{} compressor {}",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    if enabled { "enabled" } else { "disabled" }
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetCompressorThreshold {
+                strip,
+                threshold_percent,
+            }) => {
+                state.set_compressor_threshold(strip, threshold_percent);
+                state.last_notice = format!(
+                    "{} compressor threshold {}%",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    threshold_percent.round()
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetCompressorRatio { strip, ratio }) => {
+                state.set_compressor_ratio(strip, ratio);
+                state.last_notice = format!(
+                    "{} compressor ratio {:.1}:1",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    ratio
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetCompressorMakeupGain { strip, gain_db }) => {
+                state.set_compressor_makeup_gain(strip, gain_db);
+                state.last_notice = format!(
+                    "{} compressor makeup {:.1} dB",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    gain_db
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetEqEnabled { strip, enabled }) => {
+                state.set_eq_enabled(strip, enabled);
+                state.last_notice = format!(
+                    "{} EQ {}",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    if enabled { "enabled" } else { "disabled" }
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetEqLowGain { strip, gain_db }) => {
+                state.set_eq_low_gain(strip, gain_db);
+                state.last_notice = format!(
+                    "{} low EQ {:.1} dB",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    gain_db
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetEqMidGain { strip, gain_db }) => {
+                state.set_eq_mid_gain(strip, gain_db);
+                state.last_notice = format!(
+                    "{} mid EQ {:.1} dB",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    gain_db
+                );
+                persist_runtime_state(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetEqHighGain { strip, gain_db }) => {
+                state.set_eq_high_gain(strip, gain_db);
+                state.last_notice = format!(
+                    "{} high EQ {:.1} dB",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    gain_db
                 );
                 persist_runtime_state(&mut state);
                 push_snapshot(&updates_tx, &state);
@@ -895,18 +1707,30 @@ fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUp
                     }
                 }
                 persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::AddSink { label }) => {
                 let created = state.add_input_sink(&label);
                 state.last_notice = format!("Added new sink {}", created.label);
                 persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::AddOutput { label }) => {
                 let created = state.add_output_sink(&label);
                 state.last_notice = format!("Added new output {}", created.label);
                 persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::ResetMixer) => {
+                state.reset_mixer();
+                state.last_notice = "Reset sinks and outputs to defaults".to_string();
+                refresh_inventory(&mut state, false);
+                persist_runtime_state(&mut state);
+                midi_feedback.sync_connection(&mut state);
+                midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetMidiBinding {
@@ -928,6 +1752,46 @@ fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUp
                     binding_label
                 );
                 persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetRouteMidiBinding {
+                strip,
+                output,
+                controller,
+            }) => {
+                state.set_route_midi_binding(strip, output, controller);
+                let binding_label = controller
+                    .map(|value| format!("CC {value}"))
+                    .unwrap_or_else(|| "cleared".to_string());
+                let output_label = state.output_name(output).unwrap_or("output").to_string();
+                state.last_notice = format!(
+                    "{} route to {} MIDI binding {}",
+                    state.strip_label(strip).unwrap_or("Strip"),
+                    output_label,
+                    binding_label
+                );
+                persist_runtime_state(&mut state);
+                midi_feedback.send_snapshot(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SetMidiFeedbackOutput { port_name }) => {
+                state.set_midi_feedback_output(port_name);
+                state.last_notice = state
+                    .midi_feedback
+                    .output_port_name
+                    .as_ref()
+                    .map(|name| format!("Selected MIDI feedback output {name}"))
+                    .unwrap_or_else(|| "Disabled MIDI feedback output".to_string());
+                persist_runtime_state(&mut state);
+                midi_feedback.sync_connection(&mut state);
+                midi_feedback.send_snapshot(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::SyncMidiFeedback) => {
+                midi_feedback.sync_connection(&mut state);
+                midi_feedback.send_snapshot(&mut state);
+                state.last_notice = state.inventory.midi_feedback_status.clone();
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::ApplyMidiCc { controller, value }) => {
@@ -939,11 +1803,14 @@ fn engine_loop(control_rx: Receiver<AudioControlMsg>, updates_tx: Sender<AudioUp
                 };
                 if affected > 0 {
                     persist_runtime_state(&mut state);
+                    midi_feedback.send_snapshot(&mut state);
                 }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::RefreshTopology) => {
                 refresh_inventory(&mut state, true);
+                midi_feedback.sync_connection(&mut state);
+                midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
@@ -1038,16 +1905,39 @@ fn refresh_inventory(state: &mut AudioEngineState, update_notice: bool) {
 
     match scan_midi_inputs() {
         Ok(inputs) => {
-            state.inventory.midi_status = if inputs.is_empty() {
-                "MIDI subsystem ready, but no input devices were found".to_string()
-            } else {
-                format!("MIDI subsystem ready with {} inputs", inputs.len())
-            };
             state.inventory.midi_inputs = inputs;
         }
         Err(error) => {
             state.inventory.midi_status = format!("MIDI unavailable: {error}");
             state.inventory.midi_inputs.clear();
+        }
+    }
+
+    match scan_midi_outputs() {
+        Ok(outputs) => {
+            state.inventory.midi_outputs = outputs;
+            if !state.inventory.midi_status.starts_with("MIDI unavailable:") {
+                state.inventory.midi_status = match (
+                    state.inventory.midi_inputs.len(),
+                    state.inventory.midi_outputs.len(),
+                ) {
+                    (0, 0) => "MIDI subsystem ready, but no input or output devices were found"
+                        .to_string(),
+                    (inputs, outputs) => {
+                        format!(
+                            "MIDI subsystem ready with {inputs} input(s) and {outputs} output(s)"
+                        )
+                    }
+                };
+            }
+        }
+        Err(error) => {
+            state.inventory.midi_outputs.clear();
+            if state.inventory.midi_status.starts_with("MIDI unavailable:") {
+                state.inventory.midi_status = format!("MIDI unavailable: {error}");
+            } else {
+                state.inventory.midi_status = format!("MIDI output scan failed: {error}");
+            }
         }
     }
 
@@ -1359,6 +2249,65 @@ mod tests {
     }
 
     #[test]
+    fn midi_feedback_messages_cover_strip_and_route_bindings() {
+        let mut state = AudioEngineState::default();
+        let input_id = state.input_strips[0].id;
+        let output_id = state.output_strips[0].id;
+
+        state.apply_volume(input_id, NormalizedVolume::from_percent(25.0).unwrap());
+        state.toggle_mute(input_id);
+        state.set_midi_binding(input_id, MidiControlTarget::Volume, Some(14));
+        state.set_midi_binding(input_id, MidiControlTarget::Mute, Some(15));
+        state.set_route_midi_binding(input_id, output_id, Some(16));
+
+        let messages = collect_midi_feedback_messages(&state);
+
+        assert!(messages.contains(&MidiFeedbackMessage {
+            controller: 14,
+            value: 32,
+        }));
+        assert!(messages.contains(&MidiFeedbackMessage {
+            controller: 15,
+            value: MIDI_FEEDBACK_ON_VALUE,
+        }));
+        assert!(messages.contains(&MidiFeedbackMessage {
+            controller: 16,
+            value: MIDI_FEEDBACK_ON_VALUE,
+        }));
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.controller != MIDI_FEEDBACK_CHANNEL_STATUS)
+        );
+    }
+
+    #[test]
+    fn effects_shape_input_meter_levels() {
+        let mut state = AudioEngineState::default();
+        let strip_id = state.input_strips[0].id;
+        state.input_strips[0].volume = NormalizedVolume::from_percent(20.0).unwrap();
+        state.update_vu_meters(3);
+        let baseline = state.input_strips[0].meter_level;
+
+        state.set_gate_enabled(strip_id, true);
+        state.set_gate_threshold(strip_id, 25.0);
+        state.set_gate_floor(strip_id, 0.0);
+        state.update_vu_meters(3);
+        let gated = state.input_strips[0].meter_level;
+
+        state.set_gate_enabled(strip_id, false);
+        state.set_compressor_enabled(strip_id, true);
+        state.set_compressor_threshold(strip_id, 5.0);
+        state.set_compressor_ratio(strip_id, 10.0);
+        state.set_compressor_makeup_gain(strip_id, 12.0);
+        state.update_vu_meters(3);
+        let compressed = state.input_strips[0].meter_level;
+
+        assert!(gated.as_ratio() < baseline.as_ratio());
+        assert!(compressed.as_ratio() > baseline.as_ratio());
+    }
+
+    #[test]
     fn vu_meters_follow_inputs_and_routes() {
         let mut state = AudioEngineState::default();
         let output_id = state.output_strips[0].id;
@@ -1455,6 +2404,39 @@ mod tests {
     }
 
     #[test]
+    fn reset_mixer_restores_default_layout() {
+        let mut state = AudioEngineState::default();
+        state.set_midi_feedback_output(Some("MIDI Mix OUT".to_string()));
+        state.add_input_sink("Podcast");
+        state.add_output_sink("Headphones");
+        state.toggle_mute(state.input_strips[0].id);
+        state.set_eq_enabled(state.input_strips[0].id, true);
+
+        state.reset_mixer();
+
+        assert_eq!(state.input_strips.len(), DEFAULT_INPUTS.len());
+        assert_eq!(state.output_strips.len(), DEFAULT_OUTPUTS.len());
+        assert_eq!(
+            state.midi_feedback.output_port_name.as_deref(),
+            Some("MIDI Mix OUT")
+        );
+        assert!(
+            state
+                .input_strips
+                .iter()
+                .chain(state.output_strips.iter())
+                .all(|strip| !strip.muted)
+        );
+        assert!(
+            state
+                .input_strips
+                .iter()
+                .chain(state.output_strips.iter())
+                .all(|strip| strip.effects.active_effect_count() == 0 && !strip.effects.bypassed)
+        );
+    }
+
+    #[test]
     fn persisted_state_round_trips_custom_mixer_config() {
         let mut state = AudioEngineState::default();
         let input_id = state.input_strips[0].id;
@@ -1466,7 +2448,20 @@ mod tests {
         state.set_midi_binding(input_id, MidiControlTarget::Volume, Some(21));
         state.set_midi_binding(input_id, MidiControlTarget::Mute, Some(22));
         state.toggle_route(input_id, output_id);
+        state.set_route_midi_binding(input_id, output_id, Some(23));
         state.toggle_mono(input_id);
+        state.set_gate_enabled(input_id, true);
+        state.set_gate_threshold(input_id, 27.0);
+        state.set_gate_floor(input_id, 10.0);
+        state.set_compressor_enabled(input_id, true);
+        state.set_compressor_threshold(input_id, 66.0);
+        state.set_compressor_ratio(input_id, 4.5);
+        state.set_compressor_makeup_gain(input_id, 6.0);
+        state.set_eq_enabled(input_id, true);
+        state.set_eq_low_gain(input_id, -2.5);
+        state.set_eq_mid_gain(input_id, 1.0);
+        state.set_eq_high_gain(input_id, 3.5);
+        state.set_midi_feedback_output(Some("MIDI Mix OUT".to_string()));
         let created_input = state.add_input_sink("Podcast");
         let created_output = state.add_output_sink("Headphones");
         state.toggle_route(created_input.id, created_output.id);
@@ -1489,6 +2484,34 @@ mod tests {
         assert_eq!(restored.input_strips[0].channel_count, 2);
         assert_eq!(restored.input_strips[0].midi.volume_cc, Some(21));
         assert_eq!(restored.input_strips[0].midi.mute_cc, Some(22));
+        assert_eq!(restored.input_strips[0].routes[0].midi_cc, Some(23));
+        assert!(restored.input_strips[0].effects.gate.enabled);
+        assert_eq!(
+            restored.input_strips[0].effects.gate.threshold_percent,
+            27.0
+        );
+        assert_eq!(restored.input_strips[0].effects.gate.floor_percent, 10.0);
+        assert!(restored.input_strips[0].effects.compressor.enabled);
+        assert_eq!(
+            restored.input_strips[0]
+                .effects
+                .compressor
+                .threshold_percent,
+            66.0
+        );
+        assert_eq!(restored.input_strips[0].effects.compressor.ratio, 4.5);
+        assert_eq!(
+            restored.input_strips[0].effects.compressor.makeup_gain_db,
+            6.0
+        );
+        assert!(restored.input_strips[0].effects.eq.enabled);
+        assert_eq!(restored.input_strips[0].effects.eq.low_gain_db, -2.5);
+        assert_eq!(restored.input_strips[0].effects.eq.mid_gain_db, 1.0);
+        assert_eq!(restored.input_strips[0].effects.eq.high_gain_db, 3.5);
+        assert_eq!(
+            restored.midi_feedback.output_port_name.as_deref(),
+            Some("MIDI Mix OUT")
+        );
         assert!(restored.output_strips[0].muted);
         assert!(
             restored
