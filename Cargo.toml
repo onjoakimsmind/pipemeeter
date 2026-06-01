@@ -1,0 +1,20 @@
+[package]
+name = "pipemeeter"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+desktop-ui = ["dep:dioxus", "dep:dioxus-desktop", "dep:tokio"]
+system-audio = ["dep:midir", "dep:pipewire"]
+ui-preview = ["dep:dioxus", "dep:dioxus-ssr"]
+
+[dependencies]
+dioxus = { version = "0.5.6", default-features = false, features = ["macro", "html", "signals", "hooks"], optional = true }
+dioxus-desktop = { version = "0.5.6", default-features = false, features = ["tokio_runtime", "transparent"], optional = true }
+dioxus-ssr = { version = "0.5.6", optional = true }
+midir = { version = "0.11", optional = true }
+pipewire = { version = "0.10", optional = true }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "time"], optional = true }
+toml = "0.8"
