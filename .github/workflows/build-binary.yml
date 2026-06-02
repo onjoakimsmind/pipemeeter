@@ -40,7 +40,49 @@ jobs:
         run: |
           mkdir -p dist
           install -m 755 target/release/pipemeeter dist/pipemeeter
-          tar -C dist -czf pipemeeter-linux-x86_64.tar.gz pipemeeter
+          ldd target/release/pipemeeter > dist/pipemeeter-linux-x86_64.ldd.txt
+          cat > dist/run-pipemeeter.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          BINARY="$HERE/pipemeeter"
+
+          if ! command -v ldd >/dev/null 2>&1; then
+            echo "ldd is not available on this system, starting Pipemeeter directly." >&2
+            exec "$BINARY" "$@"
+          fi
+
+          MISSING_LIBS="$(ldd "$BINARY" | awk '/not found/ { print $1 }')"
+          if [ -n "$MISSING_LIBS" ]; then
+            echo "Pipemeeter is missing runtime libraries on this machine:" >&2
+            echo "$MISSING_LIBS" >&2
+            echo >&2
+            echo "See pipemeeter-linux-x86_64.ldd.txt for the dependency list captured in CI." >&2
+            exit 1
+          fi
+
+          exec "$BINARY" "$@"
+          EOF
+          chmod +x dist/run-pipemeeter.sh
+          cat > dist/README-linux.txt <<'EOF'
+          This artifact contains a native Linux desktop build of Pipemeeter.
+
+          It is dynamically linked against GTK/WebKitGTK system libraries and may not run
+          unchanged on every distribution.
+
+          Start it with:
+
+            ./run-pipemeeter.sh
+
+          The launcher checks for missing shared libraries and prints them if your machine
+          does not have the required runtime dependencies installed.
+          EOF
+          tar -C dist -czf pipemeeter-linux-x86_64.tar.gz \
+            pipemeeter \
+            run-pipemeeter.sh \
+            README-linux.txt \
+            pipemeeter-linux-x86_64.ldd.txt
           sha256sum pipemeeter-linux-x86_64.tar.gz > pipemeeter-linux-x86_64.tar.gz.sha256
 
       - name: Upload binary artifact
@@ -50,3 +92,39 @@ jobs:
           path: |
             pipemeeter-linux-x86_64.tar.gz
             pipemeeter-linux-x86_64.tar.gz.sha256
+
+  build-preview:
+    name: Build portable UI preview
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate preview artifact
+        run: cargo run --release --features "ui-preview"
+
+      - name: Package preview artifact
+        run: |
+          mkdir -p preview-dist
+          install -m 644 target/pipemeeter-preview/index.html preview-dist/index.html
+          cat > preview-dist/README.txt <<'EOF'
+          Open index.html in a browser to preview the Pipemeeter UI without native Linux GUI
+          runtime dependencies.
+          EOF
+          tar -C preview-dist -czf pipemeeter-ui-preview.tar.gz index.html README.txt
+          sha256sum pipemeeter-ui-preview.tar.gz > pipemeeter-ui-preview.tar.gz.sha256
+
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipemeeter-ui-preview
+          path: |
+            pipemeeter-ui-preview.tar.gz
+            pipemeeter-ui-preview.tar.gz.sha256
