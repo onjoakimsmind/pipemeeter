@@ -1,31 +1,32 @@
 # Maintainer: onjoakimsmind
 pkgname=pipemeeter
-pkgver=0.1.0
+pkgver=0.1.0.beta
 pkgrel=1
+_gittag="v0.1.0-beta"
 pkgdesc="A native Linux audio mixer built with Rust, Dioxus and PipeWire"
 arch=('x86_64' 'aarch64')
 url="https://github.com/onjoakimsmind/pipemeeter"
 license=('MIT')
 depends=('pipewire' 'pipewire-pulse' 'webkit2gtk-4.1' 'gtk3')
 makedepends=('rust' 'cargo')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/onjoakimsmind/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::https://github.com/onjoakimsmind/$pkgname/archive/refs/tags/${_gittag}.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-${_gittag#v}"
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-${_gittag#v}"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     cargo build --release --locked --features "desktop-ui system-audio"
 }
 
 package() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-${_gittag#v}"
     install -Dm755 target/release/pipemeeter "$pkgdir/usr/bin/pipemeeter"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 packaging/pipemeeter.desktop "$pkgdir/usr/share/applications/pipemeeter.desktop"

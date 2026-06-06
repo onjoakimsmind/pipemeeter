@@ -81,8 +81,14 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binary
-        run: cargo build --release --features "desktop-ui system-audio"
+      - name: Download pre-built binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pipemeeter-linux-x86_64
+          path: target/release/
+
+      - name: Mark binary executable
+        run: chmod +x target/release/pipemeeter
 
       - name: Build .deb
         run: cargo deb --no-build --features "desktop-ui system-audio"
