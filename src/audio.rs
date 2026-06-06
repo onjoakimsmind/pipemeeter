@@ -1,7 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::{
+    collections::{HashMap, HashSet},
     env, fmt, fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -20,9 +21,15 @@ use serde_json::Value;
 const DEFAULT_OUTPUTS: [&str; 2] = ["Speakers", "Stream"];
 const METER_CHANNEL_COUNT: usize = 2;
 const CONFIG_FILE_NAME: &str = "config.toml";
-const CONFIG_VERSION: u32 = 2;
+const CONFIG_VERSION: u32 = 3;
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
 const AUTO_TOPOLOGY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Debounce for structural FX changes (bypass, enable/disable effects).
+const FX_RUNTIME_REBUILD_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Debounce for EQ-only changes: fires after the user stops adjusting sliders.
+const FX_EQ_REBUILD_DEBOUNCE: Duration = Duration::from_millis(800);
+const FX_EQ_INPLACE_DEBOUNCE: Duration = Duration::from_millis(50);
+const PIPEWIRE_VOLUME_SYNC_RATE: Duration = Duration::from_millis(80);
 const PIPEMEETER_VIRTUAL_CABLE_PREFIX: &str = "pipemeeter.";
 const PIPEMEETER_STRIP_SINK_PREFIX: &str = "pipemeeter-strip.";
 const PIPEMEETER_BUS_SINK_PREFIX: &str = "pipemeeter-bus.";
@@ -338,8 +345,11 @@ impl MidiInputRuntime {
                         let channel = status & 0x0F;
                         let number = message[1];
                         let value = message.get(2).copied().unwrap_or(0);
+                        // Skip Note Off (0x80) and Note On with velocity 0 (both mean button released)
+                        if status & 0xF0 == 0x80 || (status & 0xF0 == 0x90 && value == 0) {
+                            return;
+                        }
                         let kind = match status & 0xF0 {
-                            0x80 => Some(MidiMessageKind::Note),
                             0x90 => Some(MidiMessageKind::Note),
                             0xB0 => Some(MidiMessageKind::ControlChange),
                             _ => None,
@@ -347,13 +357,12 @@ impl MidiInputRuntime {
                         let Some(kind) = kind else {
                             return;
                         };
-                        let normalized_value = if status & 0xF0 == 0x80 { 0 } else { value };
                         let _ = sender.send(AudioControlMsg::ApplyMidiEvent {
                             event: MidiEvent {
                                 kind,
                                 channel,
                                 number,
-                                value: normalized_value,
+                                value,
                             },
                         });
                     },
@@ -690,9 +699,14 @@ fn collect_midi_feedback_messages(state: &AudioEngineState) -> Vec<MidiFeedbackM
             FxMidiTarget::CompressorRatio,
             FxMidiTarget::CompressorMakeupGain,
             FxMidiTarget::EqEnabled,
-            FxMidiTarget::EqLowGain,
-            FxMidiTarget::EqMidGain,
-            FxMidiTarget::EqHighGain,
+            FxMidiTarget::Eq63Gain,
+            FxMidiTarget::Eq125Gain,
+            FxMidiTarget::Eq250Gain,
+            FxMidiTarget::Eq500Gain,
+            FxMidiTarget::Eq1000Gain,
+            FxMidiTarget::Eq2000Gain,
+            FxMidiTarget::Eq4000Gain,
+            FxMidiTarget::Eq8000Gain,
         ] {
             let Some(binding) = strip.fx_midi.binding(target) else {
                 continue;
@@ -780,7 +794,7 @@ impl StripKind {
     pub fn route_target_label(self) -> &'static str {
         match self {
             Self::Strip => "Bus",
-            Self::Bus => "Output",
+            Self::Bus => "Route target",
             Self::HardwareSource | Self::VirtualCable => "Route target",
             Self::Output => "Route target",
         }
@@ -789,7 +803,7 @@ impl StripKind {
     pub fn route_target_label_plural(self) -> &'static str {
         match self {
             Self::Strip => "buses",
-            Self::Bus => "outputs",
+            Self::Bus => "route targets",
             Self::HardwareSource | Self::VirtualCable => "route targets",
             Self::Output => "route targets",
         }
@@ -802,7 +816,7 @@ impl StripKind {
             Self::Strip => {
                 "Bind exactly one source or virtual cable, then send this strip into one or more buses."
             }
-            Self::Bus => "Collect strips in this bus, then map the bus to one or more outputs.",
+            Self::Bus => "Collect strips in this bus, then route it onward.",
             Self::Output => "Outputs do not route onward.",
         }
     }
@@ -812,7 +826,7 @@ impl StripKind {
             Self::HardwareSource => "Choose from a strip",
             Self::VirtualCable => "Choose from a strip",
             Self::Strip => "No bus sends",
-            Self::Bus => "No output mappings",
+            Self::Bus => "No route targets",
             Self::Output => "Direct output",
         }
     }
@@ -840,6 +854,7 @@ pub enum StripRole {
     VirtualCable,
     ChannelStrip,
     Bus,
+    FxBus,
     OutputBus,
     SystemOutput,
 }
@@ -851,6 +866,7 @@ impl StripRole {
             Self::VirtualCable => "Virtual cable",
             Self::ChannelStrip => "Channel strip",
             Self::Bus => "Bus",
+            Self::FxBus => "FX bus",
             Self::OutputBus => "Output bus",
             Self::SystemOutput => "System output",
         }
@@ -918,9 +934,14 @@ pub enum FxMidiTarget {
     CompressorRatio,
     CompressorMakeupGain,
     EqEnabled,
-    EqLowGain,
-    EqMidGain,
-    EqHighGain,
+    Eq63Gain,
+    Eq125Gain,
+    Eq250Gain,
+    Eq500Gain,
+    Eq1000Gain,
+    Eq2000Gain,
+    Eq4000Gain,
+    Eq8000Gain,
 }
 
 impl FxMidiTarget {
@@ -935,9 +956,14 @@ impl FxMidiTarget {
             Self::CompressorRatio => "compressor ratio",
             Self::CompressorMakeupGain => "compressor makeup",
             Self::EqEnabled => "EQ enable",
-            Self::EqLowGain => "low EQ",
-            Self::EqMidGain => "mid EQ",
-            Self::EqHighGain => "high EQ",
+            Self::Eq63Gain => "63 Hz EQ",
+            Self::Eq125Gain => "125 Hz EQ",
+            Self::Eq250Gain => "250 Hz EQ",
+            Self::Eq500Gain => "500 Hz EQ",
+            Self::Eq1000Gain => "1 kHz EQ",
+            Self::Eq2000Gain => "2 kHz EQ",
+            Self::Eq4000Gain => "4 kHz EQ",
+            Self::Eq8000Gain => "8 kHz EQ",
         }
     }
 
@@ -949,12 +975,93 @@ impl FxMidiTarget {
                 | Self::CompressorThreshold
                 | Self::CompressorRatio
                 | Self::CompressorMakeupGain
-                | Self::EqLowGain
-                | Self::EqMidGain
-                | Self::EqHighGain
+                | Self::Eq63Gain
+                | Self::Eq125Gain
+                | Self::Eq250Gain
+                | Self::Eq500Gain
+                | Self::Eq1000Gain
+                | Self::Eq2000Gain
+                | Self::Eq4000Gain
+                | Self::Eq8000Gain
         )
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EqBand {
+    Hz63,
+    Hz125,
+    Hz250,
+    Hz500,
+    Hz1000,
+    Hz2000,
+    Hz4000,
+    Hz8000,
+}
+
+impl EqBand {
+    pub const ALL: [Self; 8] = [
+        Self::Hz63,
+        Self::Hz125,
+        Self::Hz250,
+        Self::Hz500,
+        Self::Hz1000,
+        Self::Hz2000,
+        Self::Hz4000,
+        Self::Hz8000,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hz63 => "63 Hz",
+            Self::Hz125 => "125 Hz",
+            Self::Hz250 => "250 Hz",
+            Self::Hz500 => "500 Hz",
+            Self::Hz1000 => "1 kHz",
+            Self::Hz2000 => "2 kHz",
+            Self::Hz4000 => "4 kHz",
+            Self::Hz8000 => "8 kHz",
+        }
+    }
+
+    pub fn midi_target(self) -> FxMidiTarget {
+        match self {
+            Self::Hz63 => FxMidiTarget::Eq63Gain,
+            Self::Hz125 => FxMidiTarget::Eq125Gain,
+            Self::Hz250 => FxMidiTarget::Eq250Gain,
+            Self::Hz500 => FxMidiTarget::Eq500Gain,
+            Self::Hz1000 => FxMidiTarget::Eq1000Gain,
+            Self::Hz2000 => FxMidiTarget::Eq2000Gain,
+            Self::Hz4000 => FxMidiTarget::Eq4000Gain,
+            Self::Hz8000 => FxMidiTarget::Eq8000Gain,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EqPreset {
+    pub name: String,
+    /// Gains in dB for the 8 bands: 63 Hz, 125 Hz, 250 Hz, 500 Hz, 1 kHz, 2 kHz, 4 kHz, 8 kHz.
+    pub gains_db: [f32; 8],
+}
+
+impl EqPreset {
+    pub fn label(&self) -> &str {
+        &self.name
+    }
+}
+
+fn default_eq_presets() -> Vec<EqPreset> {
+    vec![
+        EqPreset { name: "Flat".to_string(),         gains_db: [ 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0] },
+        EqPreset { name: "Vocal boost".to_string(),  gains_db: [-2.0, -1.0,  1.0,  3.0,  4.0,  3.0,  2.0,  1.0] },
+        EqPreset { name: "Bass boost".to_string(),   gains_db: [ 5.0,  4.0,  2.0,  0.0, -1.0, -1.0,  0.0,  0.0] },
+        EqPreset { name: "Treble boost".to_string(), gains_db: [ 0.0,  0.0,  0.0,  0.0,  1.0,  2.0,  4.0,  5.0] },
+        EqPreset { name: "Presence".to_string(),     gains_db: [-1.0,  0.0,  1.0,  2.0,  4.0,  5.0,  3.0,  1.0] },
+        EqPreset { name: "Bright air".to_string(),   gains_db: [-2.0, -1.0,  0.0,  0.0,  1.0,  2.0,  4.0,  6.0] },
+    ]
+}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MidiMessageKind {
@@ -1063,11 +1170,21 @@ pub struct FxMidiBinding {
     #[serde(default)]
     pub eq_enabled: Option<MidiTrigger>,
     #[serde(default)]
-    pub eq_low_gain: Option<MidiTrigger>,
+    pub eq_63_gain: Option<MidiTrigger>,
     #[serde(default)]
-    pub eq_mid_gain: Option<MidiTrigger>,
+    pub eq_125_gain: Option<MidiTrigger>,
     #[serde(default)]
-    pub eq_high_gain: Option<MidiTrigger>,
+    pub eq_250_gain: Option<MidiTrigger>,
+    #[serde(default)]
+    pub eq_500_gain: Option<MidiTrigger>,
+    #[serde(default)]
+    pub eq_1000_gain: Option<MidiTrigger>,
+    #[serde(default)]
+    pub eq_2000_gain: Option<MidiTrigger>,
+    #[serde(default)]
+    pub eq_4000_gain: Option<MidiTrigger>,
+    #[serde(default)]
+    pub eq_8000_gain: Option<MidiTrigger>,
 }
 
 impl FxMidiBinding {
@@ -1082,9 +1199,14 @@ impl FxMidiBinding {
             FxMidiTarget::CompressorRatio => self.compressor_ratio.clone(),
             FxMidiTarget::CompressorMakeupGain => self.compressor_makeup_gain.clone(),
             FxMidiTarget::EqEnabled => self.eq_enabled.clone(),
-            FxMidiTarget::EqLowGain => self.eq_low_gain.clone(),
-            FxMidiTarget::EqMidGain => self.eq_mid_gain.clone(),
-            FxMidiTarget::EqHighGain => self.eq_high_gain.clone(),
+            FxMidiTarget::Eq63Gain => self.eq_63_gain.clone(),
+            FxMidiTarget::Eq125Gain => self.eq_125_gain.clone(),
+            FxMidiTarget::Eq250Gain => self.eq_250_gain.clone(),
+            FxMidiTarget::Eq500Gain => self.eq_500_gain.clone(),
+            FxMidiTarget::Eq1000Gain => self.eq_1000_gain.clone(),
+            FxMidiTarget::Eq2000Gain => self.eq_2000_gain.clone(),
+            FxMidiTarget::Eq4000Gain => self.eq_4000_gain.clone(),
+            FxMidiTarget::Eq8000Gain => self.eq_8000_gain.clone(),
         }
     }
 
@@ -1099,9 +1221,14 @@ impl FxMidiBinding {
             FxMidiTarget::CompressorRatio => &mut self.compressor_ratio,
             FxMidiTarget::CompressorMakeupGain => &mut self.compressor_makeup_gain,
             FxMidiTarget::EqEnabled => &mut self.eq_enabled,
-            FxMidiTarget::EqLowGain => &mut self.eq_low_gain,
-            FxMidiTarget::EqMidGain => &mut self.eq_mid_gain,
-            FxMidiTarget::EqHighGain => &mut self.eq_high_gain,
+            FxMidiTarget::Eq63Gain => &mut self.eq_63_gain,
+            FxMidiTarget::Eq125Gain => &mut self.eq_125_gain,
+            FxMidiTarget::Eq250Gain => &mut self.eq_250_gain,
+            FxMidiTarget::Eq500Gain => &mut self.eq_500_gain,
+            FxMidiTarget::Eq1000Gain => &mut self.eq_1000_gain,
+            FxMidiTarget::Eq2000Gain => &mut self.eq_2000_gain,
+            FxMidiTarget::Eq4000Gain => &mut self.eq_4000_gain,
+            FxMidiTarget::Eq8000Gain => &mut self.eq_8000_gain,
         }
     }
 
@@ -1207,21 +1334,75 @@ pub struct EqSettings {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_eq_gain_db")]
-    pub low_gain_db: f32,
+    pub band_63_gain_db: f32,
     #[serde(default = "default_eq_gain_db")]
-    pub mid_gain_db: f32,
+    #[serde(alias = "low_gain_db")]
+    pub band_125_gain_db: f32,
     #[serde(default = "default_eq_gain_db")]
-    pub high_gain_db: f32,
+    pub band_250_gain_db: f32,
+    #[serde(default = "default_eq_gain_db")]
+    pub band_500_gain_db: f32,
+    #[serde(default = "default_eq_gain_db")]
+    #[serde(alias = "mid_gain_db")]
+    pub band_1000_gain_db: f32,
+    #[serde(default = "default_eq_gain_db")]
+    pub band_2000_gain_db: f32,
+    #[serde(default = "default_eq_gain_db")]
+    pub band_4000_gain_db: f32,
+    #[serde(default = "default_eq_gain_db")]
+    #[serde(alias = "high_gain_db")]
+    pub band_8000_gain_db: f32,
 }
 
 impl Default for EqSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            low_gain_db: default_eq_gain_db(),
-            mid_gain_db: default_eq_gain_db(),
-            high_gain_db: default_eq_gain_db(),
+            band_63_gain_db: default_eq_gain_db(),
+            band_125_gain_db: default_eq_gain_db(),
+            band_250_gain_db: default_eq_gain_db(),
+            band_500_gain_db: default_eq_gain_db(),
+            band_1000_gain_db: default_eq_gain_db(),
+            band_2000_gain_db: default_eq_gain_db(),
+            band_4000_gain_db: default_eq_gain_db(),
+            band_8000_gain_db: default_eq_gain_db(),
         }
+    }
+}
+
+impl EqSettings {
+    pub fn gain_db(&self, band: EqBand) -> f32 {
+        match band {
+            EqBand::Hz63 => self.band_63_gain_db,
+            EqBand::Hz125 => self.band_125_gain_db,
+            EqBand::Hz250 => self.band_250_gain_db,
+            EqBand::Hz500 => self.band_500_gain_db,
+            EqBand::Hz1000 => self.band_1000_gain_db,
+            EqBand::Hz2000 => self.band_2000_gain_db,
+            EqBand::Hz4000 => self.band_4000_gain_db,
+            EqBand::Hz8000 => self.band_8000_gain_db,
+        }
+    }
+
+    fn set_gain_db(&mut self, band: EqBand, gain_db: f32) {
+        match band {
+            EqBand::Hz63 => self.band_63_gain_db = gain_db,
+            EqBand::Hz125 => self.band_125_gain_db = gain_db,
+            EqBand::Hz250 => self.band_250_gain_db = gain_db,
+            EqBand::Hz500 => self.band_500_gain_db = gain_db,
+            EqBand::Hz1000 => self.band_1000_gain_db = gain_db,
+            EqBand::Hz2000 => self.band_2000_gain_db = gain_db,
+            EqBand::Hz4000 => self.band_4000_gain_db = gain_db,
+            EqBand::Hz8000 => self.band_8000_gain_db = gain_db,
+        }
+    }
+
+    fn average_gain_db(&self) -> f32 {
+        EqBand::ALL
+            .into_iter()
+            .map(|band| self.gain_db(band))
+            .sum::<f32>()
+            / EqBand::ALL.len() as f32
     }
 }
 
@@ -1247,6 +1428,411 @@ impl StripEffects {
 
 fn pulse_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn pulse_escape_single_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn spa_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn fx_bus_output_node_name(bus_sink_name: &str) -> String {
+    format!("{bus_sink_name}.fx-out")
+}
+
+fn is_managed_fx_output_port(port_name: &str) -> bool {
+    port_name.starts_with(PIPEMEETER_BUS_SINK_PREFIX) && port_name.contains(".fx-out:output_")
+}
+
+fn gate_threshold_ratio(percent: f32) -> f32 {
+    (percent / 100.0).clamp(0.0, 1.0)
+}
+
+fn gate_floor_ratio(percent: f32) -> f32 {
+    (percent / 100.0).clamp(0.0, 1.0)
+}
+
+fn fx_filter_graph_config(effects: &StripEffects) -> String {
+    let mut nodes = Vec::new();
+    let mut links = Vec::new();
+    let mut current_output = None::<String>;
+
+    if !effects.bypassed && effects.gate.enabled {
+        let close_threshold = gate_threshold_ratio(effects.gate.threshold_percent);
+        let open_threshold = (close_threshold + 0.025).clamp(0.0, 1.0);
+        let dry_gain = gate_floor_ratio(effects.gate.floor_percent);
+        let gated_gain = (1.0 - dry_gain).clamp(0.0, 1.0);
+
+        nodes.push("{ type = builtin name = gate_copy label = copy }".to_string());
+        nodes.push(format!(
+            "{{ type = builtin name = gate label = noisegate control = {{ \"Open threshold\" = {open_threshold:.4} \"Close threshold\" = {close_threshold:.4} \"Attack (s)\" = 0.005 \"Release (s)\" = 0.150 \"Hold (s)\" = 0.050 }} }}"
+        ));
+        nodes.push(format!(
+            "{{ type = builtin name = gate_mix label = mixer control = {{ \"Gain 1\" = {dry_gain:.4} \"Gain 2\" = {gated_gain:.4} }} }}"
+        ));
+        links.push("{ output = \"gate_copy:Out\" input = \"gate:In\" }".to_string());
+        links.push("{ output = \"gate_copy:Out\" input = \"gate_mix:In 1\" }".to_string());
+        links.push("{ output = \"gate:Out\" input = \"gate_mix:In 2\" }".to_string());
+        current_output = Some("gate_mix:Out".to_string());
+    }
+
+    if !effects.bypassed && effects.eq.enabled {
+        let eq_bands = [
+            (
+                "eq_63",
+                "bq_lowshelf",
+                63.0,
+                0.707,
+                effects.eq.band_63_gain_db,
+            ),
+            (
+                "eq_125",
+                "bq_peaking",
+                125.0,
+                1.0,
+                effects.eq.band_125_gain_db,
+            ),
+            (
+                "eq_250",
+                "bq_peaking",
+                250.0,
+                1.0,
+                effects.eq.band_250_gain_db,
+            ),
+            (
+                "eq_500",
+                "bq_peaking",
+                500.0,
+                1.0,
+                effects.eq.band_500_gain_db,
+            ),
+            (
+                "eq_1000",
+                "bq_peaking",
+                1000.0,
+                1.0,
+                effects.eq.band_1000_gain_db,
+            ),
+            (
+                "eq_2000",
+                "bq_peaking",
+                2000.0,
+                1.0,
+                effects.eq.band_2000_gain_db,
+            ),
+            (
+                "eq_4000",
+                "bq_peaking",
+                4000.0,
+                1.0,
+                effects.eq.band_4000_gain_db,
+            ),
+            (
+                "eq_8000",
+                "bq_highshelf",
+                8000.0,
+                0.707,
+                effects.eq.band_8000_gain_db,
+            ),
+        ];
+
+        let mut previous_eq = None::<&str>;
+        for (name, label, freq, q, gain) in eq_bands {
+            nodes.push(format!(
+                "{{ type = builtin name = {name} label = {label} control = {{ \"Freq\" = {freq:.1} \"Q\" = {q:.3} \"Gain\" = {gain:.3} }} }}"
+            ));
+            if let Some(previous) = previous_eq {
+                links.push(format!(
+                    "{{ output = \"{previous}:Out\" input = \"{name}:In\" }}"
+                ));
+            }
+            previous_eq = Some(name);
+        }
+
+        if let Some(first) = eq_bands.first().map(|(name, _, _, _, _)| *name) {
+            if let Some(source) = current_output.as_deref() {
+                links.push(format!(
+                    "{{ output = \"{source}\" input = \"{first}:In\" }}"
+                ));
+            }
+        }
+        current_output = eq_bands
+            .last()
+            .map(|(name, _, _, _, _)| format!("{name}:Out"));
+    }
+
+    if current_output.is_none() {
+        nodes.push("{ type = builtin name = passthrough label = copy }".to_string());
+    }
+
+    format!(
+        "filter.graph = {{ nodes = [ {} ] links = [ {} ] }}",
+        nodes.join(" "),
+        links.join(" ")
+    )
+}
+
+fn fx_filter_chain_module_args(label: &str, bus_sink_name: &str, effects: &StripEffects) -> String {
+    let description = spa_escape(label);
+    let input_name = spa_escape(bus_sink_name);
+    let output_name = spa_escape(&fx_bus_output_node_name(bus_sink_name));
+    let graph = fx_filter_graph_config(effects);
+    format!(
+        "{{ node.description = \"{description}\" media.name = \"{description}\" audio.channels = 2 audio.position = [ FL FR ] {graph} capture.props = {{ node.name = \"{input_name}\" node.hidden = true media.class = Audio/Sink }} playback.props = {{ node.name = \"{output_name}\" node.hidden = true node.passive = true }} }}"
+    )
+}
+
+#[derive(Default)]
+struct FxRuntime {
+    children: HashMap<StripId, Child>,
+    /// PipeWire node ID of each FX bus capture sink, used for in-place EQ updates.
+    capture_node_ids: HashMap<StripId, u32>,
+    /// Tracks whether in-place EQ updates have been verified to work for each bus.
+    /// None = untried, Some(true) = confirmed working, Some(false) = unsupported.
+    eq_inplace_status: HashMap<StripId, bool>,
+}
+
+impl FxRuntime {
+    fn rebuild_all(&mut self, state: &AudioEngineState) -> Result<(), String> {
+        self.stop_all();
+
+        #[cfg(not(feature = "system-audio"))]
+        {
+            let _ = state;
+            return Ok(());
+        }
+
+        #[cfg(feature = "system-audio")]
+        {
+            let fx_buses: Vec<_> = state
+                .bus_strips
+                .iter()
+                .filter(|strip| strip.is_fx_bus())
+                .filter_map(|strip| {
+                    strip.pipewire_node_name.as_ref().map(|node_name| {
+                        (
+                            strip.id,
+                            strip.label.clone(),
+                            node_name.clone(),
+                            strip.effects.clone(),
+                        )
+                    })
+                })
+                .collect();
+
+            for (id, label, node_name, effects) in fx_buses {
+                self.start_bus(id, &label, &node_name, &effects)?;
+            }
+
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "system-audio")]
+    fn rebuild_bus(&mut self, strip_id: StripId, state: &AudioEngineState) -> Result<(), String> {
+        self.stop_bus(strip_id);
+
+        let Some(strip) = state.bus_strips.iter().find(|s| s.id == strip_id) else {
+            return Ok(());
+        };
+        let Some(ref node_name) = strip.pipewire_node_name else {
+            return Ok(());
+        };
+        self.start_bus(strip_id, &strip.label.clone(), &node_name.clone(), &strip.effects.clone())
+    }
+
+    #[cfg(feature = "system-audio")]
+    fn start_bus(
+        &mut self,
+        strip_id: StripId,
+        label: &str,
+        node_name: &str,
+        effects: &StripEffects,
+    ) -> Result<(), String> {
+        let mut child = Command::new("pw-cli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to start pw-cli for FX bus {label}: {error}"))?;
+        let Some(stdin) = child.stdin.as_mut() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("pw-cli did not expose stdin for FX bus {label}"));
+        };
+
+        let args = fx_filter_chain_module_args(label, node_name, effects);
+        writeln!(stdin, "load-module libpipewire-module-filter-chain {args}")
+            .map_err(|error| format!("failed to write FX module command: {error}"))?;
+        stdin
+            .flush()
+            .map_err(|error| format!("failed to flush FX module commands: {error}"))?;
+
+        let output_name = fx_bus_output_node_name(node_name);
+        wait_for_fx_bus_nodes(label, node_name, &output_name)?;
+
+        self.children.insert(strip_id, child);
+
+        // Find and cache the capture node ID for in-place EQ updates.
+        if let Ok(nodes) = scan_pipewire_nodes() {
+            if let Some(node) = nodes.iter().find(|n| n.node_name == node_name) {
+                self.capture_node_ids.insert(strip_id, node.id);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn stop_bus(&mut self, strip_id: StripId) {
+        if let Some(mut child) = self.children.remove(&strip_id) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.capture_node_ids.remove(&strip_id);
+        self.eq_inplace_status.remove(&strip_id);
+    }
+
+    fn stop_all(&mut self) {
+        for (_, mut child) in self.children.drain() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.capture_node_ids.clear();
+        self.eq_inplace_status.clear();
+    }
+
+    /// Attempts to update EQ band gains in-place via `pw-cli set-param` without
+    /// rebuilding the filter-chain. Returns `true` on success, `false` if unsupported
+    /// or no node ID is cached. On first call the result is memoised so future calls
+    /// can fast-fail without spawning a process.
+    #[cfg(feature = "system-audio")]
+    fn try_update_eq_inplace(&mut self, strip_id: StripId, effects: &StripEffects) -> bool {
+        if !effects.eq.enabled || effects.bypassed {
+            return false;
+        }
+        if self.eq_inplace_status.get(&strip_id) == Some(&false) {
+            return false;
+        }
+        let Some(&node_id) = self.capture_node_ids.get(&strip_id) else {
+            return false;
+        };
+        let gains = [
+            ("eq_63", effects.eq.band_63_gain_db),
+            ("eq_125", effects.eq.band_125_gain_db),
+            ("eq_250", effects.eq.band_250_gain_db),
+            ("eq_500", effects.eq.band_500_gain_db),
+            ("eq_1000", effects.eq.band_1000_gain_db),
+            ("eq_2000", effects.eq.band_2000_gain_db),
+            ("eq_4000", effects.eq.band_4000_gain_db),
+            ("eq_8000", effects.eq.band_8000_gain_db),
+        ];
+        let param_pairs: Vec<String> = gains
+            .iter()
+            .map(|(name, gain)| format!("\"{}:Gain\" {:.3}", name, gain))
+            .collect();
+        let props = format!("{{ params = [ {} ] }}", param_pairs.join(" "));
+        let ok = Command::new("pw-cli")
+            .args(["set-param", &node_id.to_string(), "Props", &props])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        self.eq_inplace_status.insert(strip_id, ok);
+        ok
+    }
+
+    /// Legacy shim: rebuild all buses (used by sync_fx_runtime).
+    fn rebuild(&mut self, state: &AudioEngineState) -> Result<(), String> {
+        self.rebuild_all(state)
+    }
+
+    fn stop(&mut self) {
+        self.stop_all();
+    }
+}
+
+#[cfg(feature = "system-audio")]
+fn wait_for_fx_bus_nodes(label: &str, input_name: &str, output_name: &str) -> Result<(), String> {
+    let mut attempts = 0_u8;
+    while attempts < 20 {
+        let input_ports = scan_pipewire_input_ports()?;
+        let output_ports = scan_pipewire_output_ports()?;
+        if input_ports
+            .iter()
+            .any(|name| name == &format!("{input_name}:playback_FL"))
+            && output_ports
+                .iter()
+                .any(|name| name == &format!("{output_name}:output_FL"))
+            && output_ports
+                .iter()
+                .any(|name| name == &format!("{output_name}:output_FR"))
+        {
+            return Ok(());
+        }
+        attempts += 1;
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(format!("FX bus {label} did not appear in PipeWire"))
+}
+
+fn scan_pipewire_input_ports() -> Result<Vec<String>, String> {
+    #[cfg(not(feature = "system-audio"))]
+    {
+        Ok(Vec::new())
+    }
+
+    #[cfg(feature = "system-audio")]
+    {
+        let output = Command::new("pw-link")
+            .args(["-i"])
+            .output()
+            .map_err(|error| format!("failed to execute pw-link -i: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "pw-link -i failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+}
+
+fn scan_pipewire_output_ports() -> Result<Vec<String>, String> {
+    #[cfg(not(feature = "system-audio"))]
+    {
+        Ok(Vec::new())
+    }
+
+    #[cfg(feature = "system-audio")]
+    {
+        let output = Command::new("pw-link")
+            .args(["-o"])
+            .output()
+            .map_err(|error| format!("failed to execute pw-link -o: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "pw-link -o failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
 }
 
 fn is_managed_virtual_cable_name(node_name: &str) -> bool {
@@ -1419,6 +2005,12 @@ fn scan_pulse_sources() -> Result<Vec<PulseSourceInfo>, String> {
                 return;
             };
             if name_value.ends_with(".monitor") {
+                *description = None;
+                *channel_count = None;
+                return;
+            }
+            // Exclude pipemeeter-managed virtual sources from the hardware source list.
+            if name_value.starts_with("pipemeeter-") {
                 *description = None;
                 *channel_count = None;
                 return;
@@ -1799,11 +2391,9 @@ fn create_pipewire_sink(node_name: &str, label: &str) -> Result<(), String> {
             return Ok(());
         }
 
+        let escaped = pulse_escape_single_quoted(label);
         let properties = format!(
-            "sink_properties=device.description=\"{}\" node.description=\"{}\" node.nick=\"{}\"",
-            pulse_escape(label),
-            pulse_escape(label),
-            pulse_escape(label)
+            "sink_properties=device.description='{escaped}' node.description='{escaped}' node.nick='{escaped}'"
         );
         let output = Command::new("pactl")
             .args([
@@ -1876,6 +2466,105 @@ fn remove_pipewire_sink(node_name: &str) -> Result<(), String> {
     }
 }
 
+fn output_source_name(sink_name: &str) -> String {
+    format!("{sink_name}-src")
+}
+
+fn create_pipewire_output_source(sink_name: &str, label: &str) -> Result<(), String> {
+    #[cfg(not(feature = "system-audio"))]
+    {
+        let _ = (sink_name, label);
+        return Ok(());
+    }
+
+    #[cfg(feature = "system-audio")]
+    {
+        let source_name = output_source_name(sink_name);
+        let existing = Command::new("pactl")
+            .args(["list", "short", "sources"])
+            .output()
+            .map_err(|e| format!("failed to query sources: {e}"))?;
+        let already_exists = String::from_utf8_lossy(&existing.stdout)
+            .lines()
+            .any(|line| {
+                let mut cols = line.split('\t');
+                cols.next();
+                cols.next().map_or(false, |name| name.trim() == format!("output.{source_name}"))
+            });
+        if already_exists {
+            return Ok(());
+        }
+
+        let source_props = format!("device.description={}", pulse_escape(label));
+        let output = Command::new("pactl")
+            .args([
+                "load-module",
+                "module-virtual-source",
+                &format!("source_name={source_name}"),
+                &format!("master={sink_name}.monitor"),
+                &format!("source_properties={source_props}"),
+            ])
+            .output()
+            .map_err(|e| format!("failed to create virtual source for {label}: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to create virtual source for {label}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn remove_pipewire_output_source(sink_name: &str) -> Result<(), String> {
+    #[cfg(not(feature = "system-audio"))]
+    {
+        let _ = sink_name;
+        return Ok(());
+    }
+
+    #[cfg(feature = "system-audio")]
+    {
+        let source_name = output_source_name(sink_name);
+        let output = Command::new("pactl")
+            .args(["list", "short", "modules"])
+            .output()
+            .map_err(|e| format!("failed to execute pactl list short modules: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "pactl list short modules failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        let needle = format!("source_name={source_name}");
+        let module_id = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                if !line.contains("module-virtual-source") || !line.contains(&needle) {
+                    return None;
+                }
+                line.split('\t').next().map(str::trim).map(str::to_string)
+            });
+
+        let Some(module_id) = module_id else {
+            return Ok(());
+        };
+
+        let unload = Command::new("pactl")
+            .args(["unload-module", &module_id])
+            .output()
+            .map_err(|e| format!("failed to unload virtual source {sink_name}: {e}"))?;
+        if !unload.status.success() {
+            return Err(format!(
+                "failed to remove virtual source for {sink_name}: {}",
+                String::from_utf8_lossy(&unload.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn sync_pipewire_strip_state(
     kind: StripKind,
     node_name: &str,
@@ -1932,6 +2621,7 @@ struct PulseLoopbackModule {
     module_id: String,
     source: String,
     sink: String,
+    mono: bool,
 }
 
 #[cfg(feature = "system-audio")]
@@ -1973,10 +2663,14 @@ fn list_pipewire_loopback_modules() -> Result<Vec<PulseLoopbackModule>, String> 
 
                 let source = pulse_module_arg_value(arguments, "source=")?;
                 let sink = pulse_module_arg_value(arguments, "sink=")?;
+                let mono = pulse_module_arg_value(arguments, "channels=")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
                 Some(PulseLoopbackModule {
                     module_id,
                     source,
                     sink,
+                    mono,
                 })
             })
             .collect())
@@ -2007,23 +2701,28 @@ fn unload_pulse_module(module_id: &str) -> Result<(), String> {
     }
 }
 
-fn create_pipewire_route_loopback(source: &str, sink: &str) -> Result<(), String> {
+fn create_pipewire_route_loopback(source: &str, sink: &str, mono: bool) -> Result<(), String> {
     #[cfg(not(feature = "system-audio"))]
     {
-        let _ = (source, sink);
+        let _ = (source, sink, mono);
         return Ok(());
     }
 
     #[cfg(feature = "system-audio")]
     {
+        let mut args = vec![
+            "load-module".to_string(),
+            "module-loopback".to_string(),
+            format!("source={source}"),
+            format!("sink={sink}"),
+            "latency_msec=1".to_string(),
+        ];
+        if mono {
+            args.push("channels=1".to_string());
+            args.push("channel_map=mono".to_string());
+        }
         let output = Command::new("pactl")
-            .args([
-                "load-module",
-                "module-loopback",
-                &format!("source={source}"),
-                &format!("sink={sink}"),
-                "latency_msec=1",
-            ])
+            .args(&args)
             .output()
             .map_err(|error| {
                 format!("failed to execute pactl load-module module-loopback: {error}")
@@ -2039,9 +2738,9 @@ fn create_pipewire_route_loopback(source: &str, sink: &str) -> Result<(), String
     }
 }
 
-fn desired_pipewire_route_pairs(
+fn desired_pipewire_loopback_pairs(
     state: &AudioEngineState,
-) -> std::collections::HashSet<(String, String)> {
+) -> std::collections::HashSet<(String, String, bool)> {
     let source_names = state
         .source_strips
         .iter()
@@ -2076,16 +2775,6 @@ fn desired_pipewire_route_pairs(
                 .map(|name| (strip.id, name))
         })
         .collect::<std::collections::HashMap<_, _>>();
-    let output_names = state
-        .output_strips
-        .iter()
-        .filter_map(|strip| {
-            strip
-                .pipewire_node_name
-                .clone()
-                .map(|name| (strip.id, name))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
 
     let mut desired = std::collections::HashSet::new();
 
@@ -2097,12 +2786,12 @@ fn desired_pipewire_route_pairs(
             continue;
         };
         if let Some(source) = source_names.get(&assignment.source_id).cloned() {
-            desired.insert((source, strip_sink.clone()));
+            desired.insert((source, strip_sink.clone(), strip.mono));
         }
         let strip_monitor = format!("{strip_sink}.monitor");
         for route in strip.routes.iter().filter(|route| route.enabled) {
             if let Some(bus_sink) = bus_names.get(&route.output_id).cloned() {
-                desired.insert((strip_monitor.clone(), bus_sink));
+                desired.insert((strip_monitor.clone(), bus_sink, false));
             }
         }
     }
@@ -2112,9 +2801,13 @@ fn desired_pipewire_route_pairs(
             continue;
         };
         let bus_monitor = format!("{bus_sink}.monitor");
-        for route in bus.routes.iter().filter(|route| route.enabled) {
-            if let Some(output_sink) = output_names.get(&route.output_id).cloned() {
-                desired.insert((bus_monitor.clone(), output_sink));
+        if !bus.is_fx_bus() {
+            for hw_sink in &bus.hardware_outputs {
+                // Only route to sinks that are currently available to avoid
+                // spamming loopback creation for unplugged devices.
+                if state.inventory.hardware_sinks.contains(hw_sink) {
+                    desired.insert((bus_monitor.clone(), hw_sink.clone(), false));
+                }
             }
         }
     }
@@ -2122,8 +2815,177 @@ fn desired_pipewire_route_pairs(
     desired
 }
 
+fn desired_pipewire_link_pairs(
+    state: &AudioEngineState,
+) -> std::collections::HashSet<(String, String)> {
+    let bus_names = state
+        .bus_strips
+        .iter()
+        .filter_map(|strip| {
+            strip
+                .pipewire_node_name
+                .clone()
+                .map(|name| (strip.id, name))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut desired = std::collections::HashSet::new();
+
+    for bus in state.bus_strips.iter().filter(|strip| strip.is_fx_bus()) {
+        let Some(bus_sink) = bus_names.get(&bus.id).cloned() else {
+            continue;
+        };
+        let output_node = fx_bus_output_node_name(&bus_sink);
+        for route in bus.routes.iter().filter(|route| route.enabled) {
+            if let Some(target_bus_sink) = bus_names.get(&route.output_id).cloned() {
+                desired.insert((
+                    format!("{output_node}:output_FL"),
+                    format!("{target_bus_sink}:playback_FL"),
+                ));
+                desired.insert((
+                    format!("{output_node}:output_FR"),
+                    format!("{target_bus_sink}:playback_FR"),
+                ));
+            }
+        }
+    }
+
+    desired
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PipewirePortLink {
+    output: String,
+    input: String,
+}
+
+fn list_pipewire_links() -> Result<Vec<PipewirePortLink>, String> {
+    #[cfg(not(feature = "system-audio"))]
+    {
+        Ok(Vec::new())
+    }
+
+    #[cfg(feature = "system-audio")]
+    {
+        let output = Command::new("pw-link")
+            .arg("-l")
+            .output()
+            .map_err(|error| format!("failed to execute pw-link -l: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "pw-link -l failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        let mut links = Vec::new();
+        let mut current_port = None::<String>;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !line.starts_with(' ') && !line.starts_with('\t') {
+                current_port = Some(trimmed.to_string());
+                continue;
+            }
+            if let Some(input) = trimmed.strip_prefix("|-> ") {
+                if let Some(output_port) = current_port.clone() {
+                    links.push(PipewirePortLink {
+                        output: output_port,
+                        input: input.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(links)
+    }
+}
+
+fn create_pipewire_link(output: &str, input: &str) -> Result<(), String> {
+    #[cfg(not(feature = "system-audio"))]
+    {
+        let _ = (output, input);
+        Ok(())
+    }
+
+    #[cfg(feature = "system-audio")]
+    {
+        // Never wait for missing ports here: the engine thread must stay responsive
+        // even when an FX node fails to appear or PipeWire is still catching up.
+        let result = Command::new("pw-link")
+            .args(["-L", output, input])
+            .output()
+            .map_err(|error| format!("failed to execute pw-link: {error}"))?;
+        if !result.status.success() {
+            return Err(format!(
+                "failed to link {output} -> {input}: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn remove_pipewire_link(output: &str, input: &str) -> Result<(), String> {
+    #[cfg(not(feature = "system-audio"))]
+    {
+        let _ = (output, input);
+        Ok(())
+    }
+
+    #[cfg(feature = "system-audio")]
+    {
+        let result = Command::new("pw-link")
+            .args(["-d", output, input])
+            .output()
+            .map_err(|error| format!("failed to execute pw-link -d: {error}"))?;
+        if !result.status.success() {
+            return Err(format!(
+                "failed to unlink {output} -> {input}: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn sync_pipewire_links(state: &mut AudioEngineState, errors: &mut Vec<String>) {
+    let desired_links = desired_pipewire_link_pairs(state);
+    let existing_links = match list_pipewire_links() {
+        Ok(links) => links,
+        Err(error) => {
+            errors.push(error);
+            return;
+        }
+    };
+
+    let existing_by_pair = existing_links
+        .into_iter()
+        .filter(|link| is_managed_fx_output_port(&link.output))
+        .map(|link| ((link.output, link.input), true))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for (output, input) in existing_by_pair.keys() {
+        if !desired_links.contains(&(output.clone(), input.clone())) {
+            if let Err(error) = remove_pipewire_link(output, input) {
+                errors.push(error);
+            }
+        }
+    }
+
+    for (output, input) in desired_links {
+        if existing_by_pair.contains_key(&(output.clone(), input.clone())) {
+            continue;
+        }
+        if let Err(error) = create_pipewire_link(&output, &input) {
+            errors.push(error);
+        }
+    }
+}
+
 fn sync_pipewire_routes(state: &mut AudioEngineState) {
-    let desired_routes = desired_pipewire_route_pairs(state);
+    let desired_routes = desired_pipewire_loopback_pairs(state);
     let existing_routes = match list_pipewire_loopback_modules() {
         Ok(routes) => routes,
         Err(error) => {
@@ -2132,7 +2994,8 @@ fn sync_pipewire_routes(state: &mut AudioEngineState) {
         }
     };
 
-    let mut existing_by_pair = std::collections::HashMap::<(String, String), Vec<String>>::new();
+    let mut existing_by_pair =
+        std::collections::HashMap::<(String, String, bool), Vec<String>>::new();
     for route in existing_routes.into_iter().filter(|route| {
         route.source.starts_with(PIPEMEETER_VIRTUAL_CABLE_PREFIX)
             || route.source.starts_with(PIPEMEETER_STRIP_SINK_PREFIX)
@@ -2142,15 +3005,15 @@ fn sync_pipewire_routes(state: &mut AudioEngineState) {
             || route.sink.starts_with(PIPEMEETER_BUS_SINK_PREFIX)
     }) {
         existing_by_pair
-            .entry((route.source, route.sink))
+            .entry((route.source, route.sink, route.mono))
             .or_default()
             .push(route.module_id);
     }
 
     let mut errors = Vec::new();
 
-    for ((source, sink), module_ids) in &existing_by_pair {
-        let should_keep = desired_routes.contains(&(source.clone(), sink.clone()));
+    for ((source, sink, mono), module_ids) in &existing_by_pair {
+        let should_keep = desired_routes.contains(&(source.clone(), sink.clone(), *mono));
         let keep_from = usize::from(should_keep);
         for module_id in module_ids.iter().skip(keep_from) {
             if let Err(error) = unload_pulse_module(module_id) {
@@ -2159,15 +3022,17 @@ fn sync_pipewire_routes(state: &mut AudioEngineState) {
         }
     }
 
-    for (source, sink) in desired_routes {
-        if existing_by_pair.contains_key(&(source.clone(), sink.clone())) {
+    for (source, sink, mono) in desired_routes {
+        if existing_by_pair.contains_key(&(source.clone(), sink.clone(), mono)) {
             continue;
         }
 
-        if let Err(error) = create_pipewire_route_loopback(&source, &sink) {
+        if let Err(error) = create_pipewire_route_loopback(&source, &sink, mono) {
             errors.push(error);
         }
     }
+
+    sync_pipewire_links(state, &mut errors);
 
     if let Some(error) = errors.into_iter().next() {
         state.last_notice = format!("{}; route sync failed: {error}", state.last_notice);
@@ -2207,6 +3072,7 @@ pub struct MixerStrip {
     pub kind: StripKind,
     pub label: String,
     pub pipewire_node_name: Option<String>,
+    pub fx_bus: bool,
     pub volume: NormalizedVolume,
     pub meter_level: NormalizedVolume,
     pub channel_count: usize,
@@ -2218,6 +3084,8 @@ pub struct MixerStrip {
     pub input_assignment: Option<InputAssignment>,
     pub routes: Vec<RouteState>,
     pub effects: StripEffects,
+    /// Hardware PulseAudio sink names this bus routes to directly (mix buses only).
+    pub hardware_outputs: Vec<String>,
 }
 
 impl MixerStrip {
@@ -2228,6 +3096,7 @@ impl MixerStrip {
             kind,
             label: label.into(),
             pipewire_node_name: None,
+            fx_bus: false,
             volume: NormalizedVolume::UNITY,
             meter_level: NormalizedVolume::new(0.0).expect("zero meter level should be valid"),
             channel_count,
@@ -2239,6 +3108,7 @@ impl MixerStrip {
             input_assignment: None,
             routes: Vec::new(),
             effects: StripEffects::default(),
+            hardware_outputs: Vec::new(),
         }
     }
 
@@ -2274,12 +3144,26 @@ impl MixerStrip {
         self.kind == StripKind::Bus
     }
 
+    pub fn is_fx_bus(&self) -> bool {
+        self.kind == StripKind::Bus && self.fx_bus
+    }
+
+    pub fn is_mix_bus(&self) -> bool {
+        self.kind == StripKind::Bus && !self.fx_bus
+    }
+
     pub fn role(&self) -> StripRole {
         match self.kind {
             StripKind::HardwareSource => StripRole::HardwareSource,
             StripKind::VirtualCable => StripRole::VirtualCable,
             StripKind::Strip => StripRole::ChannelStrip,
-            StripKind::Bus => StripRole::Bus,
+            StripKind::Bus => {
+                if self.is_fx_bus() {
+                    StripRole::FxBus
+                } else {
+                    StripRole::Bus
+                }
+            }
             StripKind::Output => {
                 if self.is_managed_output() {
                     StripRole::OutputBus
@@ -2292,6 +3176,58 @@ impl MixerStrip {
 
     pub fn role_label(&self) -> &'static str {
         self.role().label()
+    }
+
+    pub fn route_target_label(&self) -> &'static str {
+        match self.kind {
+            StripKind::Strip => "Bus send",
+            StripKind::Bus if self.is_fx_bus() => "Chain target",
+            StripKind::Bus => "Output",
+            StripKind::HardwareSource | StripKind::VirtualCable | StripKind::Output => {
+                "Route target"
+            }
+        }
+    }
+
+    pub fn route_target_label_plural(&self) -> &'static str {
+        match self.kind {
+            StripKind::Strip => "bus sends",
+            StripKind::Bus if self.is_fx_bus() => "chain targets",
+            StripKind::Bus => "outputs",
+            StripKind::HardwareSource | StripKind::VirtualCable | StripKind::Output => {
+                "route targets"
+            }
+        }
+    }
+
+    pub fn route_hint(&self) -> &'static str {
+        match self.kind {
+            StripKind::HardwareSource => {
+                "Sources are assigned to strips; they do not route directly."
+            }
+            StripKind::VirtualCable => "Virtual cables feed strips; they do not route directly.",
+            StripKind::Strip => {
+                "Bind exactly one source or virtual cable, then send this strip into one or more mix or FX buses."
+            }
+            StripKind::Bus if self.is_fx_bus() => {
+                "Collect strip sends in this FX bus, shape them, then send the result into other FX buses or back into one or more mix buses."
+            }
+            StripKind::Bus => {
+                "Collect strips in this bus, then map the bus to one or more outputs."
+            }
+            StripKind::Output => "Outputs do not route onward.",
+        }
+    }
+
+    pub fn empty_route_hint(&self) -> &'static str {
+        match self.kind {
+            StripKind::HardwareSource => "Choose from a strip",
+            StripKind::VirtualCable => "Choose from a strip",
+            StripKind::Strip => "No bus sends",
+            StripKind::Bus if self.is_fx_bus() => "No chain targets",
+            StripKind::Bus => "No output mappings",
+            StripKind::Output => "Direct output",
+        }
     }
 
     fn fx_midi_feedback_value(&self, target: FxMidiTarget) -> u8 {
@@ -2309,9 +3245,14 @@ impl MixerStrip {
                 makeup_gain_to_midi(self.effects.compressor.makeup_gain_db)
             }
             FxMidiTarget::EqEnabled => midi_bool_value(self.effects.eq.enabled),
-            FxMidiTarget::EqLowGain => eq_gain_to_midi(self.effects.eq.low_gain_db),
-            FxMidiTarget::EqMidGain => eq_gain_to_midi(self.effects.eq.mid_gain_db),
-            FxMidiTarget::EqHighGain => eq_gain_to_midi(self.effects.eq.high_gain_db),
+            FxMidiTarget::Eq63Gain => eq_gain_to_midi(self.effects.eq.gain_db(EqBand::Hz63)),
+            FxMidiTarget::Eq125Gain => eq_gain_to_midi(self.effects.eq.gain_db(EqBand::Hz125)),
+            FxMidiTarget::Eq250Gain => eq_gain_to_midi(self.effects.eq.gain_db(EqBand::Hz250)),
+            FxMidiTarget::Eq500Gain => eq_gain_to_midi(self.effects.eq.gain_db(EqBand::Hz500)),
+            FxMidiTarget::Eq1000Gain => eq_gain_to_midi(self.effects.eq.gain_db(EqBand::Hz1000)),
+            FxMidiTarget::Eq2000Gain => eq_gain_to_midi(self.effects.eq.gain_db(EqBand::Hz2000)),
+            FxMidiTarget::Eq4000Gain => eq_gain_to_midi(self.effects.eq.gain_db(EqBand::Hz4000)),
+            FxMidiTarget::Eq8000Gain => eq_gain_to_midi(self.effects.eq.gain_db(EqBand::Hz8000)),
         }
     }
 }
@@ -2339,6 +3280,8 @@ struct PersistedStrip {
     label: String,
     #[serde(default)]
     pipewire_node_name: Option<String>,
+    #[serde(default)]
+    fx_bus: bool,
     volume: f32,
     #[serde(default = "default_channel_count")]
     channel_count: usize,
@@ -2354,6 +3297,8 @@ struct PersistedStrip {
     routes: Vec<RouteState>,
     #[serde(default)]
     effects: StripEffects,
+    #[serde(default)]
+    hardware_outputs: Vec<String>,
 }
 
 impl PersistedState {
@@ -2391,7 +3336,8 @@ impl PersistedState {
     }
 
     fn into_runtime(self) -> Result<AudioEngineState, String> {
-        if self.version != CONFIG_VERSION {
+        // Accept both v2 (old output-strip model) and v3 (hardware routing model).
+        if self.version != CONFIG_VERSION && self.version != 2 {
             return Err(format!(
                 "unsupported config version {}; expected {}",
                 self.version, CONFIG_VERSION
@@ -2406,6 +3352,18 @@ impl PersistedState {
         let bus_ids = self
             .bus_strips
             .iter()
+            .map(|strip| StripId::new(strip.id))
+            .collect::<Vec<_>>();
+        let mix_bus_ids = self
+            .bus_strips
+            .iter()
+            .filter(|strip| !strip.fx_bus)
+            .map(|strip| StripId::new(strip.id))
+            .collect::<Vec<_>>();
+        let fx_bus_ids = self
+            .bus_strips
+            .iter()
+            .filter(|strip| strip.fx_bus)
             .map(|strip| StripId::new(strip.id))
             .collect::<Vec<_>>();
         let output_ids = self
@@ -2435,7 +3393,7 @@ impl PersistedState {
         let bus_strips = self
             .bus_strips
             .into_iter()
-            .map(|strip| strip.into_runtime_bus(&output_ids))
+            .map(|strip| strip.into_runtime_bus(&mix_bus_ids, &fx_bus_ids, &output_ids))
             .collect::<Result<Vec<_>, _>>()?;
 
         let max_strip_id = source_strips
@@ -2459,6 +3417,7 @@ impl PersistedState {
             midi_learn_target: None,
             next_strip_id: self.next_strip_id.max(max_strip_id),
             last_notice: "Loaded config".to_string(),
+            eq_presets: default_eq_presets(),
         })
     }
 }
@@ -2470,6 +3429,7 @@ impl PersistedStrip {
             kind: strip.kind,
             label: strip.label,
             pipewire_node_name: strip.pipewire_node_name,
+            fx_bus: strip.fx_bus,
             volume: strip.volume.as_ratio(),
             channel_count: strip.channel_count,
             mono: strip.mono,
@@ -2479,6 +3439,7 @@ impl PersistedStrip {
             input_assignment: strip.input_assignment,
             routes: strip.routes,
             effects: strip.effects,
+            hardware_outputs: strip.hardware_outputs,
         }
     }
 
@@ -2545,7 +3506,12 @@ impl PersistedStrip {
         Ok(strip)
     }
 
-    fn into_runtime_bus(self, output_ids: &[StripId]) -> Result<MixerStrip, String> {
+    fn into_runtime_bus(
+        self,
+        mix_bus_ids: &[StripId],
+        fx_bus_ids: &[StripId],
+        output_ids: &[StripId],
+    ) -> Result<MixerStrip, String> {
         if self.kind != StripKind::Bus {
             return Err(format!("bus strip {} must use bus kind", self.id));
         }
@@ -2556,10 +3522,19 @@ impl PersistedStrip {
             ));
         }
 
-        let valid_targets = output_ids
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
+        let valid_targets = if self.fx_bus {
+            mix_bus_ids
+                .iter()
+                .chain(fx_bus_ids.iter())
+                .copied()
+                .filter(|candidate| *candidate != StripId::new(self.id))
+                .collect::<std::collections::HashSet<_>>()
+        } else {
+            output_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+        };
         let strip = self.into_runtime_strip()?;
         if strip
             .routes
@@ -2567,7 +3542,7 @@ impl PersistedStrip {
             .any(|route| !valid_targets.contains(&route.output_id))
         {
             return Err(format!(
-                "bus strip {} references an output target that does not exist",
+                "bus strip {} references a route target that does not exist",
                 strip.id.as_u32()
             ));
         }
@@ -2600,6 +3575,7 @@ impl PersistedStrip {
             .pipewire_node_name
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        strip.fx_bus = self.fx_bus;
         strip.volume = NormalizedVolume::new(self.volume)
             .map_err(|error| format!("invalid saved volume for strip {}: {error}", self.id))?;
         strip.channel_count = self.channel_count.max(1);
@@ -2611,6 +3587,7 @@ impl PersistedStrip {
         strip.input_assignment = self.input_assignment;
         strip.routes = self.routes;
         strip.effects = self.effects;
+        strip.hardware_outputs = self.hardware_outputs;
         Ok(strip)
     }
 }
@@ -2659,6 +3636,8 @@ pub struct BackendInventory {
     pub midi_outputs: Vec<MidiPortInfo>,
     pub midi_feedback_status: String,
     pub midi_feedback_debug: Vec<String>,
+    /// Non-managed hardware audio sinks available for direct bus routing.
+    pub hardware_sinks: Vec<String>,
 }
 
 impl Default for BackendInventory {
@@ -2673,6 +3652,7 @@ impl Default for BackendInventory {
             midi_outputs: Vec::new(),
             midi_feedback_status: "MIDI feedback disabled".to_string(),
             midi_feedback_debug: Vec::new(),
+            hardware_sinks: Vec::new(),
         }
     }
 }
@@ -2689,6 +3669,8 @@ pub struct AudioEngineState {
     pub midi_learn_target: Option<MidiLearnTarget>,
     pub next_strip_id: u32,
     pub last_notice: String,
+    /// EQ presets loaded from `eq_presets.toml`; not persisted in the main config.
+    pub eq_presets: Vec<EqPreset>,
 }
 
 #[derive(Debug, Default)]
@@ -2723,6 +3705,7 @@ impl Default for AudioEngineState {
             midi_learn_target: None,
             next_strip_id,
             last_notice: "Booting audio engine".to_string(),
+            eq_presets: default_eq_presets(),
         }
     }
 }
@@ -2783,11 +3766,135 @@ impl AudioEngineState {
             .map(|strip| strip.label.as_str())
     }
 
-    pub fn route_target_name(&self, strip_kind: StripKind, target_id: StripId) -> Option<&str> {
-        match strip_kind {
-            StripKind::Strip => self.bus_name(target_id),
-            StripKind::Bus => self.output_name(target_id),
-            StripKind::HardwareSource | StripKind::VirtualCable | StripKind::Output => None,
+    fn sync_fx_bus_route_targets(&mut self) {
+        let target_specs = self
+            .bus_strips
+            .iter()
+            .map(|strip| {
+                (
+                    strip.id,
+                    strip.is_mix_bus(),
+                    strip.pipewire_node_name.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for bus in &mut self.bus_strips {
+            if !bus.is_fx_bus() {
+                continue;
+            }
+
+            let previous_routes = std::mem::take(&mut bus.routes);
+            let mut previous_routes_by_target = previous_routes
+                .into_iter()
+                .map(|route| (route.output_id, route))
+                .collect::<std::collections::HashMap<_, _>>();
+
+            let mut next_routes = target_specs
+                .iter()
+                .filter(|(target_id, _, _)| *target_id != bus.id)
+                .filter(|(_, is_mix_bus, _)| *is_mix_bus)
+                .map(|(target_id, _, target_key)| {
+                    if let Some(mut route) = previous_routes_by_target.remove(target_id) {
+                        route.output_id = *target_id;
+                        route.output_key = target_key.clone();
+                        route
+                    } else {
+                        RouteState {
+                            output_id: *target_id,
+                            enabled: false,
+                            midi_binding: None,
+                            midi_cc: None,
+                            output_key: target_key.clone(),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            next_routes.extend(
+                target_specs
+                    .iter()
+                    .filter(|(target_id, _, _)| *target_id != bus.id)
+                    .filter(|(_, is_mix_bus, _)| !*is_mix_bus)
+                    .map(|(target_id, _, target_key)| {
+                        if let Some(mut route) = previous_routes_by_target.remove(target_id) {
+                            route.output_id = *target_id;
+                            route.output_key = target_key.clone();
+                            route
+                        } else {
+                            RouteState {
+                                output_id: *target_id,
+                                enabled: false,
+                                midi_binding: None,
+                                midi_cc: None,
+                                output_key: target_key.clone(),
+                            }
+                        }
+                    }),
+            );
+
+            bus.routes = next_routes;
+        }
+    }
+
+    fn fx_route_creates_cycle(&self, source_id: StripId, target_id: StripId) -> bool {
+        if source_id == target_id {
+            return true;
+        }
+
+        let mut pending = vec![target_id];
+        let mut visited = std::collections::HashSet::new();
+
+        while let Some(current_id) = pending.pop() {
+            if !visited.insert(current_id) {
+                continue;
+            }
+            if current_id == source_id {
+                return true;
+            }
+
+            let Some(current_bus) = self
+                .bus_strips
+                .iter()
+                .find(|strip| strip.id == current_id && strip.is_fx_bus())
+            else {
+                continue;
+            };
+
+            for next_id in current_bus
+                .routes
+                .iter()
+                .filter(|route| route.enabled)
+                .map(|route| route.output_id)
+            {
+                if self
+                    .bus_strips
+                    .iter()
+                    .any(|strip| strip.id == next_id && strip.is_fx_bus())
+                {
+                    pending.push(next_id);
+                }
+            }
+        }
+
+        false
+    }
+
+    fn strip_ref(&self, strip_id: StripId) -> Option<&MixerStrip> {
+        self.source_strips
+            .iter()
+            .chain(self.input_strips.iter())
+            .chain(self.bus_strips.iter())
+            .chain(self.output_strips.iter())
+            .find(|strip| strip.id == strip_id)
+    }
+
+    pub fn route_target_name(&self, strip_id: StripId, target_id: StripId) -> Option<&str> {
+        match self.strip_ref(strip_id) {
+            Some(strip) if strip.is_mixer_strip() => self.bus_name(target_id),
+            Some(strip) if strip.is_fx_bus() => self.bus_name(target_id),
+            Some(strip) if strip.is_bus() => self.output_name(target_id),
+            _ => None,
         }
     }
 
@@ -2845,7 +3952,7 @@ impl AudioEngineState {
 
     fn apply_volume(&mut self, strip_id: StripId, volume: NormalizedVolume) {
         if let Some(target) = self.strip_mut(strip_id) {
-            if target.kind.supports_volume_and_mute() {
+            if target.kind.supports_volume_and_mute() && !target.is_fx_bus() {
                 target.volume = volume;
             } else {
                 self.last_notice = format!("{} does not support volume control", target.label);
@@ -2921,37 +4028,66 @@ impl AudioEngineState {
         sink_name.to_string()
     }
 
-    fn toggle_route(&mut self, strip_id: StripId, output_id: StripId) {
+    fn toggle_route(&mut self, strip_id: StripId, output_id: StripId) -> Result<bool, String> {
+        let source_is_fx_bus = self
+            .bus_strips
+            .iter()
+            .any(|candidate| candidate.id == strip_id && candidate.is_fx_bus());
+        let Some(target) = self
+            .input_strips
+            .iter()
+            .chain(self.bus_strips.iter())
+            .find(|candidate| candidate.id == strip_id)
+        else {
+            return Err(format!(
+                "Tried to toggle route on non-routable strip {}",
+                strip_id.as_u32()
+            ));
+        };
+
+        let Some(route_position) = target
+            .routes
+            .iter()
+            .position(|route| route.output_id == output_id)
+        else {
+            return Err(format!(
+                "Tried to toggle missing route {} on {}",
+                output_id.as_u32(),
+                strip_id.as_u32()
+            ));
+        };
+
+        let next_enabled = !target.routes[route_position].enabled;
+        if next_enabled && source_is_fx_bus && self.fx_route_creates_cycle(strip_id, output_id) {
+            return Err(format!(
+                "{} cannot chain into {} because that would create an FX feedback loop",
+                self.strip_label(strip_id).unwrap_or("FX bus"),
+                self.strip_label(output_id).unwrap_or("target"),
+            ));
+        }
+
         if let Some(target) = self
             .input_strips
             .iter_mut()
             .chain(self.bus_strips.iter_mut())
             .find(|candidate| candidate.id == strip_id)
         {
-            if let Some(route) = target
-                .routes
-                .iter_mut()
-                .find(|route| route.output_id == output_id)
-            {
-                route.enabled = !route.enabled;
-            } else {
-                self.last_notice = format!(
-                    "Tried to toggle missing route {} on {}",
-                    output_id.as_u32(),
-                    strip_id.as_u32()
-                );
+            if let Some(route) = target.routes.get_mut(route_position) {
+                route.enabled = next_enabled;
+                return Ok(route.enabled);
             }
-        } else {
-            self.last_notice = format!(
-                "Tried to toggle route on non-routable strip {}",
-                strip_id.as_u32()
-            );
         }
+
+        Err(format!(
+            "Tried to toggle missing route {} on {}",
+            output_id.as_u32(),
+            strip_id.as_u32()
+        ))
     }
 
     fn toggle_mute(&mut self, strip_id: StripId) {
         if let Some(target) = self.strip_mut(strip_id) {
-            if target.kind.supports_volume_and_mute() {
+            if target.kind.supports_volume_and_mute() && !target.is_fx_bus() {
                 target.muted = !target.muted;
             } else {
                 self.last_notice = format!("{} cannot be muted directly", target.label);
@@ -2974,8 +4110,7 @@ impl AudioEngineState {
         }
     }
 
-    #[cfg(test)]
-    fn add_virtual_cable(&mut self, label: &str) -> MixerStrip {
+        fn add_virtual_cable(&mut self, label: &str) -> MixerStrip {
         self.add_virtual_cable_with_node_name(label, None)
     }
 
@@ -3034,13 +4169,33 @@ impl AudioEngineState {
 
     #[cfg(test)]
     fn add_bus(&mut self, label: &str) -> MixerStrip {
-        self.add_bus_with_node_name(label, None)
+        self.add_bus_with_node_name(label, None, false)
+    }
+
+    fn add_bus_hardware_output(&mut self, strip_id: StripId, sink_name: String) {
+        if let Some(bus) = self.bus_strips.iter_mut().find(|b| b.id == strip_id) {
+            if !bus.hardware_outputs.contains(&sink_name) {
+                bus.hardware_outputs.push(sink_name);
+            }
+        }
+    }
+
+    fn remove_bus_hardware_output(&mut self, strip_id: StripId, sink_name: &str) {
+        if let Some(bus) = self.bus_strips.iter_mut().find(|b| b.id == strip_id) {
+            bus.hardware_outputs.retain(|s| s != sink_name);
+        }
+    }
+
+    #[cfg(test)]
+    fn add_fx_bus(&mut self, label: &str) -> MixerStrip {
+        self.add_bus_with_node_name(label, None, true)
     }
 
     fn add_bus_with_node_name(
         &mut self,
         label: &str,
         pipewire_node_name: Option<String>,
+        fx_bus: bool,
     ) -> MixerStrip {
         let id = StripId::new(self.next_strip_id);
         self.next_strip_id += 1;
@@ -3051,18 +4206,32 @@ impl AudioEngineState {
             normalize_label(label, StripKind::Bus, id),
         );
         bus.pipewire_node_name = pipewire_node_name;
-        bus.routes = self
-            .output_strips
-            .iter()
-            .enumerate()
-            .map(|(index, output)| RouteState {
-                output_id: output.id,
-                enabled: default_route_enabled(bus.kind, self.bus_strips.len(), index),
-                midi_binding: None,
-                midi_cc: None,
-                output_key: output.pipewire_node_name.clone(),
-            })
-            .collect();
+        bus.fx_bus = fx_bus;
+        bus.routes = if fx_bus {
+            self.bus_strips
+                .iter()
+                .filter(|candidate| candidate.is_mix_bus())
+                .map(|mix_bus| RouteState {
+                    output_id: mix_bus.id,
+                    enabled: false,
+                    midi_binding: None,
+                    midi_cc: None,
+                    output_key: mix_bus.pipewire_node_name.clone(),
+                })
+                .collect()
+        } else {
+            self.output_strips
+                .iter()
+                .enumerate()
+                .map(|(index, output)| RouteState {
+                    output_id: output.id,
+                    enabled: default_route_enabled(bus.kind, self.bus_strips.len(), index),
+                    midi_binding: None,
+                    midi_cc: None,
+                    output_key: output.pipewire_node_name.clone(),
+                })
+                .collect()
+        };
         self.bus_strips.push(bus.clone());
 
         for strip in &mut self.input_strips {
@@ -3074,6 +4243,7 @@ impl AudioEngineState {
                 output_key: bus.pipewire_node_name.clone(),
             });
         }
+        self.sync_fx_bus_route_targets();
 
         bus
     }
@@ -3099,6 +4269,9 @@ impl AudioEngineState {
         output.pipewire_node_name = pipewire_node_name;
 
         for bus in &mut self.bus_strips {
+            if bus.is_fx_bus() {
+                continue;
+            }
             bus.routes.push(RouteState {
                 output_id: output.id,
                 enabled: false,
@@ -3168,6 +4341,12 @@ impl AudioEngineState {
             for strip in &mut self.input_strips {
                 strip.routes.retain(|route| route.output_id != strip_id);
             }
+            for bus in &mut self.bus_strips {
+                if bus.is_fx_bus() {
+                    bus.routes.retain(|route| route.output_id != strip_id);
+                }
+            }
+            self.sync_fx_bus_route_targets();
             return Some(removed);
         }
         if let Some(index) = self
@@ -3403,34 +4582,13 @@ impl AudioEngineState {
         }
     }
 
-    fn set_eq_low_gain(&mut self, strip_id: StripId, gain_db: f32) {
+    fn set_eq_band_gain(&mut self, strip_id: StripId, band: EqBand, gain_db: f32) {
         if let Some(effects) = self.effects_mut(strip_id) {
-            effects.eq.low_gain_db = clamp_eq_gain_db(gain_db);
+            effects.eq.set_gain_db(band, clamp_eq_gain_db(gain_db));
         } else {
             self.last_notice = format!(
-                "Tried to update low EQ on missing strip {}",
-                strip_id.as_u32()
-            );
-        }
-    }
-
-    fn set_eq_mid_gain(&mut self, strip_id: StripId, gain_db: f32) {
-        if let Some(effects) = self.effects_mut(strip_id) {
-            effects.eq.mid_gain_db = clamp_eq_gain_db(gain_db);
-        } else {
-            self.last_notice = format!(
-                "Tried to update mid EQ on missing strip {}",
-                strip_id.as_u32()
-            );
-        }
-    }
-
-    fn set_eq_high_gain(&mut self, strip_id: StripId, gain_db: f32) {
-        if let Some(effects) = self.effects_mut(strip_id) {
-            effects.eq.high_gain_db = clamp_eq_gain_db(gain_db);
-        } else {
-            self.last_notice = format!(
-                "Tried to update high EQ on missing strip {}",
+                "Tried to update {} EQ on missing strip {}",
+                band.label(),
                 strip_id.as_u32()
             );
         }
@@ -3475,9 +4633,14 @@ impl AudioEngineState {
                 FxMidiTarget::CompressorRatio,
                 FxMidiTarget::CompressorMakeupGain,
                 FxMidiTarget::EqEnabled,
-                FxMidiTarget::EqLowGain,
-                FxMidiTarget::EqMidGain,
-                FxMidiTarget::EqHighGain,
+                FxMidiTarget::Eq63Gain,
+                FxMidiTarget::Eq125Gain,
+                FxMidiTarget::Eq250Gain,
+                FxMidiTarget::Eq500Gain,
+                FxMidiTarget::Eq1000Gain,
+                FxMidiTarget::Eq2000Gain,
+                FxMidiTarget::Eq4000Gain,
+                FxMidiTarget::Eq8000Gain,
             ] {
                 let Some(binding) = strip.fx_midi.binding(target) else {
                     continue;
@@ -3523,18 +4686,38 @@ impl AudioEngineState {
                             clamp_makeup_gain_db(midi_to_makeup_gain(event.value));
                     }
                     FxMidiTarget::EqEnabled => strip.effects.eq.enabled = !strip.effects.eq.enabled,
-                    FxMidiTarget::EqLowGain => {
-                        strip.effects.eq.low_gain_db =
-                            clamp_eq_gain_db(midi_to_eq_gain(event.value));
-                    }
-                    FxMidiTarget::EqMidGain => {
-                        strip.effects.eq.mid_gain_db =
-                            clamp_eq_gain_db(midi_to_eq_gain(event.value));
-                    }
-                    FxMidiTarget::EqHighGain => {
-                        strip.effects.eq.high_gain_db =
-                            clamp_eq_gain_db(midi_to_eq_gain(event.value));
-                    }
+                    FxMidiTarget::Eq63Gain => strip
+                        .effects
+                        .eq
+                        .set_gain_db(EqBand::Hz63, clamp_eq_gain_db(midi_to_eq_gain(event.value))),
+                    FxMidiTarget::Eq125Gain => strip.effects.eq.set_gain_db(
+                        EqBand::Hz125,
+                        clamp_eq_gain_db(midi_to_eq_gain(event.value)),
+                    ),
+                    FxMidiTarget::Eq250Gain => strip.effects.eq.set_gain_db(
+                        EqBand::Hz250,
+                        clamp_eq_gain_db(midi_to_eq_gain(event.value)),
+                    ),
+                    FxMidiTarget::Eq500Gain => strip.effects.eq.set_gain_db(
+                        EqBand::Hz500,
+                        clamp_eq_gain_db(midi_to_eq_gain(event.value)),
+                    ),
+                    FxMidiTarget::Eq1000Gain => strip.effects.eq.set_gain_db(
+                        EqBand::Hz1000,
+                        clamp_eq_gain_db(midi_to_eq_gain(event.value)),
+                    ),
+                    FxMidiTarget::Eq2000Gain => strip.effects.eq.set_gain_db(
+                        EqBand::Hz2000,
+                        clamp_eq_gain_db(midi_to_eq_gain(event.value)),
+                    ),
+                    FxMidiTarget::Eq4000Gain => strip.effects.eq.set_gain_db(
+                        EqBand::Hz4000,
+                        clamp_eq_gain_db(midi_to_eq_gain(event.value)),
+                    ),
+                    FxMidiTarget::Eq8000Gain => strip.effects.eq.set_gain_db(
+                        EqBand::Hz8000,
+                        clamp_eq_gain_db(midi_to_eq_gain(event.value)),
+                    ),
                 }
 
                 result.affected += 1;
@@ -3914,6 +5097,10 @@ fn apply_pipewire_state_for_strip(state: &mut AudioEngineState, strip_id: StripI
         return;
     };
 
+    if strip.is_fx_bus() {
+        return;
+    }
+
     let Some(node_name) = strip.pipewire_node_name.clone() else {
         return;
     };
@@ -4035,47 +5222,94 @@ fn ensure_bus_sinks_exist(state: &mut AudioEngineState) {
             .pipewire_node_name
             .clone()
             .expect("bus sink name should be assigned");
-        if let Err(error) = create_pipewire_sink(&node_name, &label) {
-            state.last_notice = format!("Failed to ensure bus {label}: {error}");
-            continue;
-        }
+        if state.bus_strips[index].is_mix_bus() {
+            if let Err(error) = create_pipewire_sink(&node_name, &label) {
+                state.last_notice = format!("Failed to ensure bus {label}: {error}");
+                continue;
+            }
+            // Create an OBS-capturable virtual source for the bus monitor.
+            if let Err(error) = create_pipewire_output_source(&node_name, &label) {
+                state.last_notice =
+                    format!("Bus {label} sink created but capture source failed: {error}");
+            }
 
-        let strip_id = state.bus_strips[index].id;
-        apply_pipewire_state_for_strip(state, strip_id);
+            let strip_id = state.bus_strips[index].id;
+            apply_pipewire_state_for_strip(state, strip_id);
+        }
     }
 }
 
-fn ensure_output_sinks_exist(state: &mut AudioEngineState) {
-    let strip_ids = state
-        .output_strips
-        .iter()
-        .filter(|strip| strip.is_managed_output())
-        .map(|strip| strip.id)
-        .collect::<Vec<_>>();
-
-    for strip_id in strip_ids {
-        let Some(index) = state
+/// On startup: remove any legacy output null-sinks from PulseAudio and clear
+/// stale bus→output routes so configs from the old output-strip model migrate
+/// cleanly to the new hardware-routing model.
+fn migrate_legacy_output_sinks(state: &mut AudioEngineState) {
+    #[cfg(feature = "system-audio")]
+    {
+        // Remove any old managed output sinks still loaded in PulseAudio.
+        let old_node_names: Vec<String> = state
             .output_strips
             .iter()
-            .position(|strip| strip.id == strip_id)
-        else {
-            continue;
-        };
-
-        let label = state.output_strips[index].label.clone();
-        let Some(node_name) = state.output_strips[index].pipewire_node_name.clone() else {
-            continue;
-        };
-
-        if let Err(error) = create_pipewire_sink(&node_name, &label) {
-            state.last_notice = format!("Failed to ensure output {label}: {error}");
-            continue;
+            .filter_map(|s| s.pipewire_node_name.clone())
+            .collect();
+        for node_name in &old_node_names {
+            let _ = remove_pipewire_output_source(node_name);
+            let _ = remove_pipewire_sink(node_name);
         }
-
-        let strip_id = state.output_strips[index].id;
-        apply_pipewire_state_for_strip(state, strip_id);
+    }
+    // Drop output_strips and clear non-FX bus routes (they pointed to output IDs).
+    state.output_strips.clear();
+    for bus in state.bus_strips.iter_mut() {
+        if !bus.is_fx_bus() {
+            bus.routes.clear();
+        }
     }
 }
+
+/// On startup: kill any orphaned pw-cli processes left over from previous
+/// Pipemeeter runs. Each FX filter-chain spawns a pw-cli child; if Pipemeeter
+/// crashes or is force-quit those children become zombies and litter PipeWire
+/// with duplicate nodes.
+fn kill_orphaned_pw_cli_processes() {
+    #[cfg(feature = "system-audio")]
+    {
+        let our_pid = std::process::id();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Ok(pid) = name_str.parse::<u32>() else {
+                continue;
+            };
+            if pid == our_pid {
+                continue;
+            }
+            let comm_path = format!("/proc/{pid}/comm");
+            let Ok(comm) = std::fs::read_to_string(&comm_path) else {
+                continue;
+            };
+            if comm.trim() != "pw-cli" {
+                continue;
+            }
+            // Skip our own children — FxRuntime manages those.
+            let stat_path = format!("/proc/{pid}/stat");
+            let Ok(stat) = std::fs::read_to_string(&stat_path) else {
+                continue;
+            };
+            let ppid: u32 = stat
+                .splitn(5, ' ')
+                .nth(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if ppid == our_pid {
+                continue;
+            }
+            let _ = Command::new("kill").arg(pid.to_string()).output();
+        }
+    }
+}
+
 
 fn clamp_percent(value: f32) -> f32 {
     value.clamp(0.0, 100.0)
@@ -4156,13 +5390,8 @@ fn apply_strip_effects_to_levels(
             }
 
             if effects.eq.enabled {
-                let band_db = match index % 3 {
-                    0 => effects.eq.low_gain_db,
-                    1 => effects.eq.high_gain_db,
-                    _ => effects.eq.mid_gain_db,
-                };
-                let blended_db = (band_db + effects.eq.mid_gain_db) / 2.0;
-                ratio *= db_to_gain(blended_db);
+                let _ = index;
+                ratio *= db_to_gain(effects.eq.average_gain_db());
             }
 
             if effects.compressor.enabled {
@@ -4178,6 +5407,38 @@ fn apply_strip_effects_to_levels(
                 .expect("effect-processed meter level should be valid")
         })
         .collect()
+}
+
+fn strip_is_fx_bus(state: &AudioEngineState, strip_id: StripId) -> bool {
+    state
+        .bus_strips
+        .iter()
+        .any(|strip| strip.id == strip_id && strip.is_fx_bus())
+}
+
+fn midi_result_touches_fx_bus(state: &AudioEngineState, result: &MidiApplyResult) -> bool {
+    result
+        .strip_ids
+        .iter()
+        .copied()
+        .any(|strip_id| strip_is_fx_bus(state, strip_id))
+}
+
+fn sync_fx_runtime(
+    state: &mut AudioEngineState,
+    fx_runtime: &mut FxRuntime,
+    meter_runtime: &mut MeterRuntime,
+) {
+    match fx_runtime.rebuild(state) {
+        Ok(()) => {
+            apply_pipewire_state_for_all_strips(state);
+            sync_pipewire_routes(state);
+            meter_runtime.sync_taps(state);
+        }
+        Err(error) => {
+            state.last_notice = format!("{}; FX backend sync failed: {error}", state.last_notice);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4238,17 +5499,14 @@ pub enum AudioControlMsg {
         strip: StripId,
         enabled: bool,
     },
-    SetEqLowGain {
+    SetEqBandGain {
         strip: StripId,
+        band: EqBand,
         gain_db: f32,
     },
-    SetEqMidGain {
+    SetEqPreset {
         strip: StripId,
-        gain_db: f32,
-    },
-    SetEqHighGain {
-        strip: StripId,
-        gain_db: f32,
+        preset: EqPreset,
     },
     RemoveStrip {
         strip: StripId,
@@ -4264,8 +5522,22 @@ pub enum AudioControlMsg {
     AddBus {
         label: String,
     },
+    AddFxBus {
+        label: String,
+        gate: bool,
+        compressor: bool,
+        eq: bool,
+    },
     AddOutput {
         label: String,
+    },
+    AddBusHardwareOutput {
+        strip: StripId,
+        sink_name: String,
+    },
+    RemoveBusHardwareOutput {
+        strip: StripId,
+        sink_name: String,
     },
     SetStripInputAssignment {
         strip: StripId,
@@ -4309,6 +5581,7 @@ pub enum AudioControlMsg {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioUpdateMsg {
     Snapshot(AudioEngineState),
+    MeterUpdate(std::collections::HashMap<StripId, Vec<f32>>),
 }
 
 pub struct EngineBridge {
@@ -4381,19 +5654,24 @@ fn engine_loop(
     let mut midi_feedback = MidiFeedbackRuntime::default();
     let mut midi_input = MidiInputRuntime::default();
     let mut meter_runtime = MeterRuntime::default();
+    let mut fx_runtime = FxRuntime::default();
     let mut meter_phase = 0_u64;
     let mut needs_persist = false;
     let mut last_state_change_at = Instant::now();
     let mut last_topology_refresh_at = Instant::now();
+    let mut fx_rebuild_due: HashMap<StripId, Instant> = HashMap::new();
+    let mut fx_eq_inplace_due: HashMap<StripId, Instant> = HashMap::new();
+    let mut dirty_pipewire_strips: HashSet<StripId> = HashSet::new();
+    let mut last_pipewire_volume_sync_at = Instant::now();
+    kill_orphaned_pw_cli_processes();
     ensure_virtual_cables_exist(&mut state);
     ensure_strip_sinks_exist(&mut state);
     ensure_bus_sinks_exist(&mut state);
-    ensure_output_sinks_exist(&mut state);
+    state.sync_fx_bus_route_targets();
+    migrate_legacy_output_sinks(&mut state);
     refresh_inventory(&mut state, false);
-    apply_pipewire_state_for_all_strips(&mut state);
-    sync_pipewire_routes(&mut state);
+    sync_fx_runtime(&mut state, &mut fx_runtime, &mut meter_runtime);
     midi_input.sync_connections(&mut state, &control_tx);
-    meter_runtime.sync_taps(&mut state);
     midi_feedback.sync_connection(&mut state);
     midi_feedback.send_snapshot(&mut state);
     state.live_meter_levels = meter_runtime.snapshot_levels();
@@ -4404,12 +5682,14 @@ fn engine_loop(
         match control_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(AudioControlMsg::SetStripVolume { strip, volume }) => {
                 state.apply_volume(strip, volume);
-                state.last_notice = format!(
-                    "Updated {} to {}%",
-                    state.strip_label(strip).unwrap_or("strip"),
-                    volume.as_percent_text()
-                );
-                apply_pipewire_state_for_strip(&mut state, strip);
+                dirty_pipewire_strips.insert(strip);
+                if last_pipewire_volume_sync_at.elapsed() >= PIPEWIRE_VOLUME_SYNC_RATE {
+                    for &id in &dirty_pipewire_strips {
+                        apply_pipewire_state_for_strip(&mut state, id);
+                    }
+                    dirty_pipewire_strips.clear();
+                    last_pipewire_volume_sync_at = Instant::now();
+                }
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
                 midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
@@ -4423,20 +5703,21 @@ fn engine_loop(
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::ToggleRoute { strip, output }) => {
-                let target_kind = state
-                    .input_strips
-                    .iter()
-                    .chain(state.bus_strips.iter())
-                    .find(|candidate| candidate.id == strip)
-                    .map(|candidate| candidate.kind)
-                    .unwrap_or(StripKind::Strip);
                 let output_label = state
-                    .route_target_name(target_kind, output)
+                    .route_target_name(strip, output)
                     .unwrap_or("route target")
                     .to_string();
-                state.toggle_route(strip, output);
+                let toggled = match state.toggle_route(strip, output) {
+                    Ok(enabled) => enabled,
+                    Err(error) => {
+                        state.last_notice = error;
+                        push_snapshot(&updates_tx, &state);
+                        continue;
+                    }
+                };
                 state.last_notice = format!(
-                    "Toggled {} on {}",
+                    "{} {} on {}",
+                    if toggled { "Enabled" } else { "Disabled" },
                     output_label,
                     state.strip_label(strip).unwrap_or("strip")
                 );
@@ -4473,6 +5754,7 @@ fn engine_loop(
                     mono_state
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                sync_pipewire_routes(&mut state);
                 midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
             }
@@ -4494,6 +5776,9 @@ fn engine_loop(
                     bypass_state
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::ResetStripEffects { strip }) => {
@@ -4503,6 +5788,9 @@ fn engine_loop(
                     state.strip_label(strip).unwrap_or("strip")
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetNoiseGateEnabled { strip, enabled }) => {
@@ -4513,6 +5801,9 @@ fn engine_loop(
                     if enabled { "enabled" } else { "disabled" }
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetNoiseGateThreshold {
@@ -4526,6 +5817,9 @@ fn engine_loop(
                     threshold_percent.round()
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetNoiseGateFloor {
@@ -4539,6 +5833,9 @@ fn engine_loop(
                     floor_percent.round()
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetCompressorEnabled { strip, enabled }) => {
@@ -4549,6 +5846,9 @@ fn engine_loop(
                     if enabled { "enabled" } else { "disabled" }
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetCompressorThreshold {
@@ -4562,6 +5862,9 @@ fn engine_loop(
                     threshold_percent.round()
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetCompressorRatio { strip, ratio }) => {
@@ -4572,6 +5875,9 @@ fn engine_loop(
                     ratio
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetCompressorMakeupGain { strip, gain_db }) => {
@@ -4582,6 +5888,9 @@ fn engine_loop(
                     gain_db
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetEqEnabled { strip, enabled }) => {
@@ -4592,39 +5901,65 @@ fn engine_loop(
                     if enabled { "enabled" } else { "disabled" }
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                }
                 push_snapshot(&updates_tx, &state);
             }
-            Ok(AudioControlMsg::SetEqLowGain { strip, gain_db }) => {
-                state.set_eq_low_gain(strip, gain_db);
+            Ok(AudioControlMsg::SetEqBandGain {
+                strip,
+                band,
+                gain_db,
+            }) => {
+                state.set_eq_band_gain(strip, band, gain_db);
                 state.last_notice = format!(
-                    "{} low EQ {:.1} dB",
+                    "{} {} EQ {:.1} dB",
                     state.strip_label(strip).unwrap_or("Strip"),
+                    band.label(),
                     gain_db
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    if fx_runtime.eq_inplace_status.get(&strip) == Some(&false) {
+                        // Known unsupported: fall back to full rebuild with long debounce.
+                        fx_rebuild_due.insert(strip, Instant::now() + FX_EQ_REBUILD_DEBOUNCE);
+                    } else {
+                        // Optimistically queue a cheap in-place update; cancel any rebuild.
+                        fx_eq_inplace_due.insert(strip, Instant::now() + FX_EQ_INPLACE_DEBOUNCE);
+                        fx_rebuild_due.remove(&strip);
+                    }
+                }
                 push_snapshot(&updates_tx, &state);
             }
-            Ok(AudioControlMsg::SetEqMidGain { strip, gain_db }) => {
-                state.set_eq_mid_gain(strip, gain_db);
+            Ok(AudioControlMsg::SetEqPreset { strip, preset }) => {
+                let [g63, g125, g250, g500, g1k, g2k, g4k, g8k] = preset.gains_db;
+                state.set_eq_band_gain(strip, EqBand::Hz63, g63);
+                state.set_eq_band_gain(strip, EqBand::Hz125, g125);
+                state.set_eq_band_gain(strip, EqBand::Hz250, g250);
+                state.set_eq_band_gain(strip, EqBand::Hz500, g500);
+                state.set_eq_band_gain(strip, EqBand::Hz1000, g1k);
+                state.set_eq_band_gain(strip, EqBand::Hz2000, g2k);
+                state.set_eq_band_gain(strip, EqBand::Hz4000, g4k);
+                state.set_eq_band_gain(strip, EqBand::Hz8000, g8k);
                 state.last_notice = format!(
-                    "{} mid EQ {:.1} dB",
+                    "{} EQ preset: {}",
                     state.strip_label(strip).unwrap_or("Strip"),
-                    gain_db
+                    preset.label()
                 );
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
-                push_snapshot(&updates_tx, &state);
-            }
-            Ok(AudioControlMsg::SetEqHighGain { strip, gain_db }) => {
-                state.set_eq_high_gain(strip, gain_db);
-                state.last_notice = format!(
-                    "{} high EQ {:.1} dB",
-                    state.strip_label(strip).unwrap_or("Strip"),
-                    gain_db
-                );
-                mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                if strip_is_fx_bus(&state, strip) {
+                    if fx_runtime.eq_inplace_status.get(&strip) == Some(&false) {
+                        fx_rebuild_due.insert(strip, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                    } else {
+                        // Preset applies all bands at once; queue in-place immediately.
+                        fx_eq_inplace_due.insert(strip, Instant::now() + FX_EQ_INPLACE_DEBOUNCE);
+                        fx_rebuild_due.remove(&strip);
+                    }
+                }
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::RemoveStrip { strip }) => {
+                let removing_fx_bus = strip_is_fx_bus(&state, strip);
                 let source_sink_name = state
                     .source_strips
                     .iter()
@@ -4642,20 +5977,31 @@ fn engine_loop(
                     .iter()
                     .find(|candidate| candidate.id == strip && candidate.kind == StripKind::Bus)
                     .and_then(|candidate| candidate.pipewire_node_name.clone());
+                // Remove bus virtual source (for OBS capture) when bus is deleted.
+                if let Some(ref node_name) = bus_sink_name {
+                    if !removing_fx_bus {
+                        let _ = remove_pipewire_output_source(node_name);
+                    }
+                }
                 let output_sink_name = state
                     .output_strips
                     .iter()
                     .find(|candidate| candidate.id == strip && candidate.is_managed_output())
                     .and_then(|candidate| candidate.pipewire_node_name.clone());
+                if let Some(ref node_name) = output_sink_name {
+                    let _ = remove_pipewire_output_source(node_name);
+                }
                 if let Some(node_name) = source_sink_name
                     .or(strip_sink_name)
                     .or(bus_sink_name)
                     .or(output_sink_name)
                 {
-                    if let Err(error) = remove_pipewire_sink(&node_name) {
-                        state.last_notice = error;
-                        push_snapshot(&updates_tx, &state);
-                        continue;
+                    if !removing_fx_bus {
+                        if let Err(error) = remove_pipewire_sink(&node_name) {
+                            state.last_notice = error;
+                            push_snapshot(&updates_tx, &state);
+                            continue;
+                        }
                     }
                 }
                 match state.remove_strip(strip) {
@@ -4668,9 +6014,16 @@ fn engine_loop(
                     }
                 }
                 refresh_inventory(&mut state, false);
-                sync_pipewire_routes(&mut state);
+                if removing_fx_bus {
+                    fx_rebuild_due.remove(&strip);
+                    fx_runtime.stop_bus(strip);
+                    sync_pipewire_routes(&mut state);
+                    meter_runtime.sync_taps(&mut state);
+                } else {
+                    sync_pipewire_routes(&mut state);
+                    meter_runtime.sync_taps(&mut state);
+                }
                 midi_input.sync_connections(&mut state, &control_tx);
-                meter_runtime.sync_taps(&mut state);
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
                 midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
@@ -4718,19 +6071,41 @@ fn engine_loop(
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::AddBus { label }) => {
-                let display_label = label.trim().to_string();
+                let display_label = normalize_label(
+                    label.trim(),
+                    StripKind::Bus,
+                    StripId::new(state.next_strip_id),
+                );
                 let sink_name = default_bus_sink_name(&display_label, &state);
                 if let Err(error) = create_pipewire_sink(&sink_name, &display_label) {
                     state.last_notice = error;
                     push_snapshot(&updates_tx, &state);
                     continue;
                 }
-                let created = state.add_bus_with_node_name(&display_label, Some(sink_name));
+                let created = state.add_bus_with_node_name(&display_label, Some(sink_name), false);
                 apply_pipewire_state_for_strip(&mut state, created.id);
                 refresh_inventory(&mut state, false);
                 state.last_notice = format!("Added bus {}", created.label);
                 sync_pipewire_routes(&mut state);
                 meter_runtime.sync_taps(&mut state);
+                mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                midi_feedback.send_snapshot(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::AddFxBus { label, gate, compressor, eq }) => {
+                let display_label = normalize_label(
+                    label.trim(),
+                    StripKind::Bus,
+                    StripId::new(state.next_strip_id),
+                );
+                let sink_name = default_bus_sink_name(&display_label, &state);
+                let created = state.add_bus_with_node_name(&display_label, Some(sink_name), true);
+                if gate { state.set_gate_enabled(created.id, true); }
+                if compressor { state.set_compressor_enabled(created.id, true); }
+                if eq { state.set_eq_enabled(created.id, true); }
+                refresh_inventory(&mut state, false);
+                state.last_notice = format!("Added FX bus {}", created.label);
+                sync_fx_runtime(&mut state, &mut fx_runtime, &mut meter_runtime);
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
                 midi_feedback.send_snapshot(&mut state);
                 push_snapshot(&updates_tx, &state);
@@ -4743,6 +6118,9 @@ fn engine_loop(
                     push_snapshot(&updates_tx, &state);
                     continue;
                 }
+                if let Err(error) = create_pipewire_output_source(&sink_name, &display_label) {
+                    state.last_notice = format!("Output created but capture source failed: {error}");
+                }
                 let created = state.add_output_sink_with_node_name(&display_label, Some(sink_name));
                 apply_pipewire_state_for_strip(&mut state, created.id);
                 refresh_inventory(&mut state, false);
@@ -4751,6 +6129,28 @@ fn engine_loop(
                 meter_runtime.sync_taps(&mut state);
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
                 midi_feedback.send_snapshot(&mut state);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::AddBusHardwareOutput { strip, sink_name }) => {
+                state.add_bus_hardware_output(strip, sink_name.clone());
+                state.last_notice = format!(
+                    "{} → {}",
+                    state.strip_label(strip).unwrap_or("Bus"),
+                    sink_name
+                );
+                sync_pipewire_routes(&mut state);
+                mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                push_snapshot(&updates_tx, &state);
+            }
+            Ok(AudioControlMsg::RemoveBusHardwareOutput { strip, sink_name }) => {
+                state.remove_bus_hardware_output(strip, &sink_name);
+                state.last_notice = format!(
+                    "Removed {} from {}",
+                    sink_name,
+                    state.strip_label(strip).unwrap_or("Bus")
+                );
+                sync_pipewire_routes(&mut state);
+                mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
                 push_snapshot(&updates_tx, &state);
             }
             Ok(AudioControlMsg::SetStripInputAssignment { strip, source }) => {
@@ -4795,6 +6195,9 @@ fn engine_loop(
                             .filter_map(|strip| strip.pipewire_node_name.clone()),
                     )
                     .collect::<Vec<_>>();
+                for node_name in &virtual_sink_names {
+                    let _ = remove_pipewire_output_source(node_name);
+                }
                 for node_name in virtual_sink_names {
                     if let Err(error) = remove_pipewire_sink(&node_name) {
                         state.last_notice = error;
@@ -4806,10 +6209,8 @@ fn engine_loop(
                 state.last_notice =
                     "Reset sources, strips, buses, and outputs to defaults".to_string();
                 refresh_inventory(&mut state, false);
-                apply_pipewire_state_for_all_strips(&mut state);
-                sync_pipewire_routes(&mut state);
+                sync_fx_runtime(&mut state, &mut fx_runtime, &mut meter_runtime);
                 midi_input.sync_connections(&mut state, &control_tx);
-                meter_runtime.sync_taps(&mut state);
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
                 midi_feedback.sync_connection(&mut state);
                 midi_feedback.send_snapshot(&mut state);
@@ -4862,15 +6263,8 @@ fn engine_loop(
                 state.clear_midi_learn();
                 state.set_route_midi_binding(strip, output, binding.clone());
                 let binding_label = MidiTrigger::format_midi_trigger(binding.as_ref());
-                let target_kind = state
-                    .input_strips
-                    .iter()
-                    .chain(state.bus_strips.iter())
-                    .find(|candidate| candidate.id == strip)
-                    .map(|candidate| candidate.kind)
-                    .unwrap_or(StripKind::Strip);
                 let output_label = state
-                    .route_target_name(target_kind, output)
+                    .route_target_name(strip, output)
                     .unwrap_or("route target")
                     .to_string();
                 state.last_notice = format!(
@@ -4956,16 +6350,7 @@ fn engine_loop(
                         MidiLearnTarget::Route { strip, output } => {
                             state.set_route_midi_binding(strip, output, Some(binding.clone()));
                             let target_label = state
-                                .route_target_name(
-                                    state
-                                        .input_strips
-                                        .iter()
-                                        .chain(state.bus_strips.iter())
-                                        .find(|candidate| candidate.id == strip)
-                                        .map(|candidate| candidate.kind)
-                                        .unwrap_or(StripKind::Strip),
-                                    output,
-                                )
+                                .route_target_name(strip, output)
                                 .unwrap_or("route target");
                             state.last_notice = format!(
                                 "{} route to {} MIDI binding {}",
@@ -5004,6 +6389,15 @@ fn engine_loop(
                     )
                 };
                 if midi_result.affected > 0 {
+                    let midi_touches_fx_bus = midi_result_touches_fx_bus(&state, &midi_result);
+                    let fx_bus_ids: Vec<StripId> = if midi_touches_fx_bus {
+                        midi_result.strip_ids.iter()
+                            .copied()
+                            .filter(|&id| strip_is_fx_bus(&state, id))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     for strip_id in midi_result.strip_ids {
                         apply_pipewire_state_for_strip(&mut state, strip_id);
                     }
@@ -5011,6 +6405,9 @@ fn engine_loop(
                         sync_pipewire_routes(&mut state);
                     }
                     mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
+                    for strip_id in fx_bus_ids {
+                        fx_rebuild_due.insert(strip_id, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                    }
                     midi_feedback.send_snapshot(&mut state);
                 }
                 push_snapshot(&updates_tx, &state);
@@ -5033,10 +6430,8 @@ fn engine_loop(
             }
             Ok(AudioControlMsg::RefreshTopology) => {
                 refresh_inventory(&mut state, true);
-                apply_pipewire_state_for_all_strips(&mut state);
-                sync_pipewire_routes(&mut state);
+                sync_fx_runtime(&mut state, &mut fx_runtime, &mut meter_runtime);
                 midi_input.sync_connections(&mut state, &control_tx);
-                meter_runtime.sync_taps(&mut state);
                 mark_runtime_state_dirty(&mut needs_persist, &mut last_state_change_at);
                 midi_feedback.sync_connection(&mut state);
                 midi_feedback.send_snapshot(&mut state);
@@ -5044,10 +6439,68 @@ fn engine_loop(
             }
             Ok(AudioControlMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 flush_runtime_state_persist(&mut state, &mut needs_persist);
+                fx_runtime.stop();
                 meter_runtime.stop_all();
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
+                if !dirty_pipewire_strips.is_empty() {
+                    for &id in &dirty_pipewire_strips {
+                        apply_pipewire_state_for_strip(&mut state, id);
+                    }
+                    dirty_pipewire_strips.clear();
+                    last_pipewire_volume_sync_at = Instant::now();
+                }
+                if !fx_rebuild_due.is_empty() {
+                    let now = Instant::now();
+                    let ready: Vec<StripId> = fx_rebuild_due
+                        .iter()
+                        .filter(|(_, due_at)| now >= **due_at)
+                        .map(|(&id, _)| id)
+                        .collect();
+                    for strip_id in ready {
+                        fx_rebuild_due.remove(&strip_id);
+                        #[cfg(feature = "system-audio")]
+                        {
+                            if let Err(error) = fx_runtime.rebuild_bus(strip_id, &state) {
+                                state.last_notice = format!("FX rebuild failed: {error}");
+                            } else {
+                                apply_pipewire_state_for_all_strips(&mut state);
+                                sync_pipewire_routes(&mut state);
+                                meter_runtime.sync_taps(&mut state);
+                            }
+                        }
+                        #[cfg(not(feature = "system-audio"))]
+                        {
+                            let _ = strip_id;
+                        }
+                    }
+                }
+                if !fx_eq_inplace_due.is_empty() {
+                    let now = Instant::now();
+                    let ready: Vec<StripId> = fx_eq_inplace_due
+                        .iter()
+                        .filter(|(_, due_at)| now >= **due_at)
+                        .map(|(&id, _)| id)
+                        .collect();
+                    for strip_id in ready {
+                        fx_eq_inplace_due.remove(&strip_id);
+                        #[cfg(feature = "system-audio")]
+                        {
+                            if let Some(strip) = state.bus_strips.iter().find(|s| s.id == strip_id) {
+                                let effects = strip.effects.clone();
+                                if !fx_runtime.try_update_eq_inplace(strip_id, &effects) {
+                                    // In-place not supported; fall back to a full rebuild.
+                                    fx_rebuild_due.insert(strip_id, Instant::now() + FX_RUNTIME_REBUILD_DEBOUNCE);
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "system-audio"))]
+                        {
+                            let _ = strip_id;
+                        }
+                    }
+                }
                 if needs_persist && last_state_change_at.elapsed() >= STATE_SAVE_DEBOUNCE {
                     flush_runtime_state_persist(&mut state, &mut needs_persist);
                 }
@@ -5063,7 +6516,24 @@ fn engine_loop(
                 meter_phase = meter_phase.wrapping_add(1);
                 state.live_meter_levels = meter_runtime.snapshot_levels();
                 state.update_vu_meters(meter_phase);
-                push_snapshot(&updates_tx, &state);
+                let meter_map = state
+                    .source_strips
+                    .iter()
+                    .chain(state.input_strips.iter())
+                    .chain(state.bus_strips.iter())
+                    .chain(state.output_strips.iter())
+                    .map(|strip| {
+                        (
+                            strip.id,
+                            strip
+                                .meter_channels
+                                .iter()
+                                .map(|v| v.as_ratio())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect();
+                let _ = updates_tx.send(AudioUpdateMsg::MeterUpdate(meter_map));
             }
         }
 
@@ -5168,7 +6638,7 @@ fn refresh_inventory(state: &mut AudioEngineState, update_notice: bool) {
                 format!("PipeWire connected with {} nodes", nodes.len())
             };
             state.inventory.pipewire_nodes = nodes;
-            sinks_synced = sync_output_sinks_to_inventory(state);
+            sinks_synced = sync_hardware_sinks_to_inventory(state);
             sources_synced = sync_real_sources_to_inventory(state);
         }
         Err(error) => {
@@ -5320,8 +6790,8 @@ fn sync_real_sources_to_inventory(state: &mut AudioEngineState) -> bool {
     previous_source_snapshot != state.source_strips
 }
 
-fn sync_output_sinks_to_inventory(state: &mut AudioEngineState) -> bool {
-    let sink_nodes = state
+fn sync_hardware_sinks_to_inventory(state: &mut AudioEngineState) -> bool {
+    let hardware_sinks: Vec<String> = state
         .inventory
         .pipewire_nodes
         .iter()
@@ -5330,102 +6800,14 @@ fn sync_output_sinks_to_inventory(state: &mut AudioEngineState) -> bool {
                 && !node.is_managed_virtual_cable()
                 && !node.is_managed_strip_sink()
                 && !node.is_managed_bus_sink()
+                && !is_managed_output_sink_name(&node.node_name)
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    if sink_nodes.is_empty() {
-        return false;
-    }
+        .map(|node| node.node_name.clone())
+        .collect();
 
-    let previous_outputs = state.output_strips.clone();
-    let previous_routes = state
-        .bus_strips
-        .iter()
-        .map(|strip| (strip.id, strip.routes.clone()))
-        .collect::<std::collections::HashMap<_, _>>();
-    let previous_output_keys = state
-        .output_strips
-        .iter()
-        .map(|strip| (strip.id, strip.output_match_key()))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut previous_outputs_by_key = std::mem::take(&mut state.output_strips)
-        .into_iter()
-        .map(|strip| (strip.output_match_key(), strip))
-        .collect::<std::collections::HashMap<_, _>>();
-
-    let mut next_outputs = Vec::with_capacity(sink_nodes.len());
-    for node in sink_nodes {
-        let mut output = previous_outputs_by_key
-            .remove(&node.node_name)
-            .unwrap_or_else(|| {
-                let id = StripId::new(state.next_strip_id);
-                state.next_strip_id += 1;
-                MixerStrip::new(id, StripKind::Output, &node.name)
-            });
-        output.kind = StripKind::Output;
-        output.label = node.name;
-        output.pipewire_node_name = Some(node.node_name);
-        output.routes.clear();
-        next_outputs.push(output);
-    }
-
-    for (input_index, input) in state.bus_strips.iter_mut().enumerate() {
-        if input.kind != StripKind::Bus {
-            continue;
-        }
-        let previous_input_routes = input.routes.clone();
-        let mut preserved_routes = previous_input_routes
-            .into_iter()
-            .filter_map(|route| {
-                route
-                    .output_key
-                    .clone()
-                    .or_else(|| {
-                        previous_output_keys
-                            .get(&route.output_id)
-                            .cloned()
-                            .filter(|value| !value.trim().is_empty())
-                    })
-                    .map(|key| (key, route))
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        let had_preserved_routes = !preserved_routes.is_empty();
-
-        input.routes = next_outputs
-            .iter()
-            .enumerate()
-            .map(|(output_index, output)| {
-                let output_key = output
-                    .pipewire_node_name
-                    .clone()
-                    .expect("synced PipeWire outputs should have a node name");
-                if let Some(mut route) = preserved_routes.remove(&output_key) {
-                    route.output_id = output.id;
-                    route.output_key = Some(output_key);
-                    route
-                } else {
-                    RouteState {
-                        output_id: output.id,
-                        enabled: if had_preserved_routes {
-                            false
-                        } else {
-                            default_route_enabled(input.kind, input_index, output_index)
-                        },
-                        midi_binding: None,
-                        midi_cc: None,
-                        output_key: Some(output_key),
-                    }
-                }
-            })
-            .collect();
-    }
-
-    state.output_strips = next_outputs;
-    previous_outputs != state.output_strips
-        || state
-            .bus_strips
-            .iter()
-            .any(|strip| previous_routes.get(&strip.id) != Some(&strip.routes))
+    let changed = hardware_sinks != state.inventory.hardware_sinks;
+    state.inventory.hardware_sinks = hardware_sinks;
+    changed
 }
 
 fn push_snapshot(updates_tx: &Sender<AudioUpdateMsg>, state: &AudioEngineState) {
@@ -5504,10 +6886,13 @@ fn move_application_stream_to_sink(
 }
 
 pub fn load_initial_state() -> AudioEngineState {
+    let eq_presets = load_eq_presets();
+
     let config_path = match config_path() {
         Ok(path) => path,
         Err(error) => {
             let mut state = AudioEngineState::default();
+            state.eq_presets = eq_presets;
             state.last_notice = format!("Config unavailable: {error}; using defaults");
             return state;
         }
@@ -5515,19 +6900,23 @@ pub fn load_initial_state() -> AudioEngineState {
 
     match load_state_from_path(&config_path) {
         Ok(Some(mut state)) => {
+            state.eq_presets = eq_presets;
             state.last_notice = format!("Loaded config from {}", config_path.display());
             state
         }
         Ok(None) => {
             let mut state = AudioEngineState::default();
-            state.last_notice = format!(
-                "No config found at {}; using defaults",
-                config_path.display()
-            );
+            state.eq_presets = eq_presets;
+            state.add_virtual_cable("PRIMARY");
+            state.last_notice =
+                "Welcome to Pipemeeter! A PRIMARY virtual cable has been created. \
+                Open Settings to add outputs and configure routing."
+                    .to_string();
             state
         }
         Err(error) => {
             let mut state = AudioEngineState::default();
+            state.eq_presets = eq_presets;
             state.last_notice = format!("Failed to load config: {error}; using defaults");
             state
         }
@@ -5547,6 +6936,67 @@ fn config_path() -> Result<PathBuf, String> {
         .join(".config")
         .join("pipemeeter")
         .join(CONFIG_FILE_NAME))
+}
+
+fn eq_presets_path() -> Option<PathBuf> {
+    let home = env::var_os("HOME")?;
+    Some(PathBuf::from(home)
+        .join(".config")
+        .join("pipemeeter")
+        .join("eq_presets.toml"))
+}
+
+/// Loads EQ presets from `~/.config/pipemeeter/eq_presets.toml`.
+/// If the file does not exist, the default file is written and built-in presets are returned.
+pub fn load_eq_presets() -> Vec<EqPreset> {
+    let Some(path) = eq_presets_path() else {
+        return default_eq_presets();
+    };
+
+    if !path.exists() {
+        let _ = write_default_eq_presets_file(&path);
+        return default_eq_presets();
+    }
+
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return default_eq_presets(),
+    };
+
+    #[derive(Deserialize)]
+    struct PresetsFile {
+        preset: Vec<EqPreset>,
+    }
+
+    match toml::from_str::<PresetsFile>(&content) {
+        Ok(file) if !file.preset.is_empty() => file.preset,
+        _ => default_eq_presets(),
+    }
+}
+
+fn write_default_eq_presets_file(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create config dir: {e}"))?;
+    }
+    let content = concat!(
+        "# Pipemeeter EQ presets\n",
+        "# Each [[preset]] block defines one preset available in the FX bus EQ dropdown.\n",
+        "# gains_db = [63Hz, 125Hz, 250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz]\n",
+        "\n",
+        "[[preset]]\nname = \"Flat\"\ngains_db = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]\n",
+        "\n",
+        "[[preset]]\nname = \"Vocal boost\"\ngains_db = [-2.0, -1.0, 1.0, 3.0, 4.0, 3.0, 2.0, 1.0]\n",
+        "\n",
+        "[[preset]]\nname = \"Bass boost\"\ngains_db = [5.0, 4.0, 2.0, 0.0, -1.0, -1.0, 0.0, 0.0]\n",
+        "\n",
+        "[[preset]]\nname = \"Treble boost\"\ngains_db = [0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 4.0, 5.0]\n",
+        "\n",
+        "[[preset]]\nname = \"Presence\"\ngains_db = [-1.0, 0.0, 1.0, 2.0, 4.0, 5.0, 3.0, 1.0]\n",
+        "\n",
+        "[[preset]]\nname = \"Bright air\"\ngains_db = [-2.0, -1.0, 0.0, 0.0, 1.0, 2.0, 4.0, 6.0]\n",
+    );
+    fs::write(path, content).map_err(|e| format!("failed to write eq_presets.toml: {e}"))
 }
 
 fn save_state_to_default_path(state: &AudioEngineState) -> Result<(), String> {
@@ -5584,7 +7034,9 @@ fn load_state_from_path(path: &Path) -> Result<Option<AudioEngineState>, String>
         .map_err(|error| format!("failed to read config file {}: {error}", path.display()))?;
     let persisted = toml::from_str::<PersistedState>(&raw)
         .map_err(|error| format!("failed to parse config file {}: {error}", path.display()))?;
-    persisted.into_runtime().map(Some)
+    let mut state = persisted.into_runtime()?;
+    state.sync_fx_bus_route_targets();
+    Ok(Some(state))
 }
 
 fn scan_midi_inputs() -> Result<Vec<MidiPortInfo>, String> {
@@ -5831,6 +7283,165 @@ mod tests {
         assert_eq!(created.kind, StripKind::Bus);
         assert_eq!(created.label, "Podcast Bus");
         assert_eq!(created.routes.len(), state.output_strips.len());
+        assert!(!created.is_fx_bus());
+    }
+
+    #[test]
+    fn adding_fx_bus_targets_mix_buses_and_input_routes() {
+        let mut state = AudioEngineState::default();
+        let main_bus = state.add_bus("Main");
+        let voice = state.add_mixer_strip("Voice");
+
+        let fx_bus = state.add_fx_bus("Verb");
+
+        assert!(fx_bus.is_fx_bus());
+        assert_eq!(fx_bus.routes.len(), 1);
+        assert_eq!(fx_bus.routes[0].output_id, main_bus.id);
+        assert!(
+            state.input_strips[0]
+                .routes
+                .iter()
+                .any(|route| route.output_id == fx_bus.id)
+        );
+        assert!(
+            state
+                .bus_strips
+                .iter()
+                .find(|strip| strip.id == main_bus.id)
+                .is_some()
+        );
+        assert_eq!(
+            state
+                .input_strips
+                .iter()
+                .find(|strip| strip.id == voice.id)
+                .expect("voice strip should still exist")
+                .routes
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn fx_buses_can_chain_into_other_fx_buses() {
+        let mut state = AudioEngineState::default();
+        let main_bus = state.add_bus("Main");
+        let first_fx = state.add_fx_bus("Verb");
+        let second_fx = state.add_fx_bus("Delay");
+
+        let first_routes = state
+            .bus_strips
+            .iter()
+            .find(|strip| strip.id == first_fx.id)
+            .expect("first fx bus should exist")
+            .routes
+            .iter()
+            .map(|route| route.output_id)
+            .collect::<Vec<_>>();
+        let second_routes = state
+            .bus_strips
+            .iter()
+            .find(|strip| strip.id == second_fx.id)
+            .expect("second fx bus should exist")
+            .routes
+            .iter()
+            .map(|route| route.output_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_routes, vec![main_bus.id, second_fx.id]);
+        assert_eq!(second_routes, vec![main_bus.id, first_fx.id]);
+    }
+
+    #[test]
+    fn fx_routes_use_pipewire_links_from_processed_output() {
+        let mut state = AudioEngineState::default();
+        let mix_bus =
+            state.add_bus_with_node_name("Main", Some("pipemeeter-bus.main".to_string()), false);
+        let fx_bus =
+            state.add_bus_with_node_name("Verb", Some("pipemeeter-bus.verb".to_string()), true);
+
+        state.toggle_route(fx_bus.id, mix_bus.id).unwrap();
+
+        let links = desired_pipewire_link_pairs(&state);
+
+        assert!(links.contains(&(
+            "pipemeeter-bus.verb.fx-out:output_FL".to_string(),
+            "pipemeeter-bus.main:playback_FL".to_string(),
+        )));
+        assert!(links.contains(&(
+            "pipemeeter-bus.verb.fx-out:output_FR".to_string(),
+            "pipemeeter-bus.main:playback_FR".to_string(),
+        )));
+    }
+
+    #[test]
+    fn fx_routes_do_not_create_dry_loopbacks() {
+        let mut state = AudioEngineState::default();
+        let mix_bus =
+            state.add_bus_with_node_name("Main", Some("pipemeeter-bus.main".to_string()), false);
+        let fx_bus =
+            state.add_bus_with_node_name("Verb", Some("pipemeeter-bus.verb".to_string()), true);
+
+        state.toggle_route(fx_bus.id, mix_bus.id).unwrap();
+
+        let loopbacks = desired_pipewire_loopback_pairs(&state);
+
+        assert!(!loopbacks.contains(&(
+            "pipemeeter-bus.verb.monitor".to_string(),
+            "pipemeeter-bus.main".to_string(),
+            false,
+        )));
+    }
+
+    #[test]
+    fn fx_bus_chain_rejects_feedback_cycles() {
+        let mut state = AudioEngineState::default();
+        state.add_bus("Main");
+        let first_fx = state.add_fx_bus("Verb");
+        let second_fx = state.add_fx_bus("Delay");
+        let third_fx = state.add_fx_bus("Doubler");
+
+        assert!(state.toggle_route(first_fx.id, second_fx.id).is_ok());
+        assert!(state.toggle_route(second_fx.id, third_fx.id).is_ok());
+
+        let error = state
+            .toggle_route(third_fx.id, first_fx.id)
+            .expect_err("fx cycles should be rejected");
+
+        assert!(error.contains("feedback loop"));
+        assert!(
+            !state
+                .bus_strips
+                .iter()
+                .find(|strip| strip.id == third_fx.id)
+                .expect("third fx bus should exist")
+                .routes
+                .iter()
+                .find(|route| route.output_id == first_fx.id)
+                .expect("route to first fx should exist")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn removing_fx_bus_prunes_routes_from_other_fx_buses() {
+        let mut state = AudioEngineState::default();
+        let main_bus = state.add_bus("Main");
+        let first_fx = state.add_fx_bus("Verb");
+        let second_fx = state.add_fx_bus("Delay");
+
+        let removed = state
+            .remove_strip(first_fx.id)
+            .expect("fx bus should be removable");
+
+        assert_eq!(removed.id, first_fx.id);
+        let remaining_fx = state
+            .bus_strips
+            .iter()
+            .find(|strip| strip.id == second_fx.id)
+            .expect("remaining fx bus should exist");
+        assert_eq!(remaining_fx.routes.len(), 1);
+        assert_eq!(remaining_fx.routes[0].output_id, main_bus.id);
     }
 
     #[test]
@@ -5892,7 +7503,7 @@ mod tests {
         let output = state.bus_strips[0].id;
         let before = state.input_strips[0].routes[0].enabled;
 
-        state.toggle_route(strip, output);
+        state.toggle_route(strip, output).unwrap();
 
         assert_ne!(before, state.input_strips[0].routes[0].enabled);
     }
@@ -5957,7 +7568,7 @@ mod tests {
         let strip = state.input_strips[0].id;
         state.set_fx_midi_binding(
             strip,
-            FxMidiTarget::EqLowGain,
+            FxMidiTarget::Eq63Gain,
             Some(MidiTrigger::control_change(30)),
         );
 
@@ -5968,7 +7579,10 @@ mod tests {
             value: 0,
         });
         assert_eq!(low.affected, 1);
-        assert_eq!(state.input_strips[0].effects.eq.low_gain_db, -12.0);
+        assert_eq!(
+            state.input_strips[0].effects.eq.gain_db(EqBand::Hz63),
+            -12.0
+        );
 
         let center = state.apply_midi_event(&MidiEvent {
             kind: MidiMessageKind::ControlChange,
@@ -5977,7 +7591,7 @@ mod tests {
             value: 64,
         });
         assert_eq!(center.affected, 1);
-        assert!(state.input_strips[0].effects.eq.low_gain_db.abs() < 0.2);
+        assert!(state.input_strips[0].effects.eq.gain_db(EqBand::Hz63).abs() < 0.2);
 
         let high = state.apply_midi_event(&MidiEvent {
             kind: MidiMessageKind::ControlChange,
@@ -5986,7 +7600,7 @@ mod tests {
             value: 127,
         });
         assert_eq!(high.affected, 1);
-        assert_eq!(state.input_strips[0].effects.eq.low_gain_db, 12.0);
+        assert_eq!(state.input_strips[0].effects.eq.gain_db(EqBand::Hz63), 12.0);
     }
 
     #[test]
@@ -6303,7 +7917,7 @@ mod tests {
             MidiControlTarget::Mute,
             Some(MidiTrigger::control_change(22)),
         );
-        state.toggle_route(input_id, bus_id);
+        state.toggle_route(input_id, bus_id).unwrap();
         state.set_route_midi_binding(input_id, bus_id, Some(MidiTrigger::control_change(23)));
         state.toggle_mono(input_id);
         state.set_gate_enabled(input_id, true);
@@ -6314,12 +7928,12 @@ mod tests {
         state.set_compressor_ratio(input_id, 4.5);
         state.set_compressor_makeup_gain(input_id, 6.0);
         state.set_eq_enabled(input_id, true);
-        state.set_eq_low_gain(input_id, -2.5);
-        state.set_eq_mid_gain(input_id, 1.0);
-        state.set_eq_high_gain(input_id, 3.5);
+        state.set_eq_band_gain(input_id, EqBand::Hz125, -2.5);
+        state.set_eq_band_gain(input_id, EqBand::Hz1000, 1.0);
+        state.set_eq_band_gain(input_id, EqBand::Hz8000, 3.5);
         state.set_fx_midi_binding(
             input_id,
-            FxMidiTarget::EqLowGain,
+            FxMidiTarget::Eq125Gain,
             Some(MidiTrigger::control_change(24)),
         );
         state.set_fx_midi_binding(
@@ -6332,8 +7946,12 @@ mod tests {
         state.set_strip_input_assignment(created_input.id, Some(source_id));
         let created_bus = state.add_bus("Headphones Bus");
         let created_output = state.add_output_sink("Headphones");
-        state.toggle_route(created_input.id, created_bus.id);
-        state.toggle_route(created_bus.id, created_output.id);
+        state
+            .toggle_route(created_input.id, created_bus.id)
+            .unwrap();
+        state
+            .toggle_route(created_bus.id, created_output.id)
+            .unwrap();
 
         let config_path = temp_config_path("round-trip");
         save_state_to_path(&state, &config_path).expect("config should save");
@@ -6392,13 +8010,22 @@ mod tests {
             6.0
         );
         assert!(restored.input_strips[0].effects.eq.enabled);
-        assert_eq!(restored.input_strips[0].effects.eq.low_gain_db, -2.5);
-        assert_eq!(restored.input_strips[0].effects.eq.mid_gain_db, 1.0);
-        assert_eq!(restored.input_strips[0].effects.eq.high_gain_db, 3.5);
+        assert_eq!(
+            restored.input_strips[0].effects.eq.gain_db(EqBand::Hz125),
+            -2.5
+        );
+        assert_eq!(
+            restored.input_strips[0].effects.eq.gain_db(EqBand::Hz1000),
+            1.0
+        );
+        assert_eq!(
+            restored.input_strips[0].effects.eq.gain_db(EqBand::Hz8000),
+            3.5
+        );
         assert_eq!(
             restored.input_strips[0]
                 .fx_midi
-                .binding(FxMidiTarget::EqLowGain),
+                .binding(FxMidiTarget::Eq125Gain),
             Some(MidiTrigger::control_change(24))
         );
         assert_eq!(

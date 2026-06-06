@@ -1,0 +1,15 @@
+# This project still uses feature-gated desktop entrypoints.
+# Use `dx serve --platform desktop --features "desktop-ui system-audio"` or
+# `dx build --platform desktop --features "desktop-ui system-audio"`.
+
+[application]
+name = "pipemeeter"
+out_dir = "dist"
+public_dir = "public"
+
+[web.app]
+title = "Pipemeeter"
+
+[bundle]
+identifier = "io.github.onjoakimsmind.pipemeeter"
+publisher = "onjoakimsmind"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Pipemeeter
+Comment=A native Linux audio mixer built with PipeWire
+Exec=pipemeeter
+Icon=pipemeeter
+Type=Application
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;mixer;pipewire;virtual cable;obs;
+StartupNotify=true

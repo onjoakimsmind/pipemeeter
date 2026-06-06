@@ -2,6 +2,30 @@
 name = "pipemeeter"
 version = "0.1.0"
 edition = "2024"
+description = "A native Linux audio mixer built with Rust, Dioxus and PipeWire"
+homepage = "https://github.com/onjoakimsmind/pipemeeter"
+repository = "https://github.com/onjoakimsmind/pipemeeter"
+license = "MIT"
+authors = ["onjoakimsmind"]
+
+[package.metadata.deb]
+name = "pipemeeter"
+maintainer = "onjoakimsmind"
+copyright = "2024, onjoakimsmind"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+A native Linux audio mixer built with Rust, Dioxus and PipeWire/PulseAudio.
+Provides virtual cables, channel strips, mix buses, FX buses with gate /
+compressor / 8-band EQ, MIDI control, and OBS integration."""
+depends = "$auto, pipewire, pipewire-pulse, libwebkit2gtk-4.1-0, libgtk-3-0"
+section = "sound"
+priority = "optional"
+assets = [
+    ["target/release/pipemeeter", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/pipemeeter/README.md", "644"],
+    ["packaging/pipemeeter.desktop", "usr/share/applications/", "644"],
+    ["pipemeeter.svg", "usr/share/icons/hicolor/scalable/apps/pipemeeter.svg", "644"],
+]
 
 [features]
 default = []
