@@ -90,6 +90,7 @@ struct MidiFeedbackMessage {
 
 const MIDI_FEEDBACK_DEBUG_LIMIT: usize = 20;
 
+#[cfg(any(test, feature = "system-audio"))]
 fn format_midi_feedback_messages(messages: &[MidiFeedbackMessage]) -> String {
     messages
         .iter()
@@ -2631,6 +2632,7 @@ fn pulse_module_arg_value(arguments: &str, key: &str) -> Option<String> {
         .find_map(|token| token.strip_prefix(key).map(str::to_string))
 }
 
+#[cfg(feature = "system-audio")]
 fn list_pipewire_loopback_modules() -> Result<Vec<PulseLoopbackModule>, String> {
     #[cfg(not(feature = "system-audio"))]
     {
@@ -2984,6 +2986,7 @@ fn sync_pipewire_links(state: &mut AudioEngineState, errors: &mut Vec<String>) {
     }
 }
 
+#[cfg(feature = "system-audio")]
 fn sync_pipewire_routes(state: &mut AudioEngineState) {
     let desired_routes = desired_pipewire_loopback_pairs(state);
     let existing_routes = match list_pipewire_loopback_modules() {
@@ -3038,6 +3041,9 @@ fn sync_pipewire_routes(state: &mut AudioEngineState) {
         state.last_notice = format!("{}; route sync failed: {error}", state.last_notice);
     }
 }
+
+#[cfg(not(feature = "system-audio"))]
+fn sync_pipewire_routes(_state: &mut AudioEngineState) {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RouteState {
@@ -3230,6 +3236,7 @@ impl MixerStrip {
         }
     }
 
+    #[cfg(any(test, feature = "system-audio"))]
     fn fx_midi_feedback_value(&self, target: FxMidiTarget) -> u8 {
         match target {
             FxMidiTarget::Bypass => midi_bool_value(self.effects.bypassed),
@@ -5327,6 +5334,7 @@ fn clamp_eq_gain_db(value: f32) -> f32 {
     value.clamp(-12.0, 12.0)
 }
 
+#[cfg(any(test, feature = "system-audio"))]
 fn midi_bool_value(value: bool) -> u8 {
     if value {
         MIDI_FEEDBACK_ON_VALUE
