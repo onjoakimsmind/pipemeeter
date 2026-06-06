@@ -92,39 +92,3 @@ jobs:
           path: |
             pipemeeter-linux-x86_64.tar.gz
             pipemeeter-linux-x86_64.tar.gz.sha256
-
-  build-preview:
-    name: Build portable UI preview
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Generate preview artifact
-        run: cargo run --release --features "ui-preview"
-
-      - name: Package preview artifact
-        run: |
-          mkdir -p preview-dist
-          install -m 644 target/pipemeeter-preview/index.html preview-dist/index.html
-          cat > preview-dist/README.txt <<'EOF'
-          Open index.html in a browser to preview the Pipemeeter UI without native Linux GUI
-          runtime dependencies.
-          EOF
-          tar -C preview-dist -czf pipemeeter-ui-preview.tar.gz index.html README.txt
-          sha256sum pipemeeter-ui-preview.tar.gz > pipemeeter-ui-preview.tar.gz.sha256
-
-      - name: Upload preview artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pipemeeter-ui-preview
-          path: |
-            pipemeeter-ui-preview.tar.gz
-            pipemeeter-ui-preview.tar.gz.sha256
